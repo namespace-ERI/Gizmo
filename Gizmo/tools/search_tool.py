@@ -1,9 +1,16 @@
+"""
+SearchTool - 基于 Google Serper API 的在线搜索工具
+
+功能：
+- 支持批量查询（query 为字符串数组），多个 query 并行执行
+- 自动检测中英文，切换对应的 location/gl/hl 参数
+- 返回每条结果的标题、链接、发布日期、来源和摘要
+"""
+
 import time
-from urllib.parse import urlparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
-import tiktoken
-from requests.exceptions import Timeout
 
 from Gizmo.tools.base_tool import BaseTool
 
@@ -11,101 +18,106 @@ _SEARCH_PARAMETERS = {
     "type": "object",
     "properties": {
         "query": {
-            "type": "string",
-            "description": "The search query string",
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "Array of query strings. "
+                "Include multiple complementary search queries in a single call."
+            ),
         }
     },
     "required": ["query"],
 }
 
 _SEARCH_DESCRIPTION = (
-    "Performs a web search. The tool retrieves the top 10 results for the query, "
-    "returning their docid (temporary index, keep unique in the main session), "
-    "source domain, and document snippet (may be truncated based on token limits)."
+    "Performs batched web searches: supply an array 'query'; "
+    "the tool retrieves the top 10 results for each query in one call."
 )
 
 
 class SearchTool(BaseTool):
-    """Google Custom Search tool."""
+    """基于 Serper API 的批量 Google 搜索工具。"""
 
-    def __init__(self, api_key: str, cx: str, snippet_max_tokens: int = 128):
+    _SERPER_URL = "https://google.serper.dev/search"
+
+    def __init__(self, api_key: str):
         super().__init__(
             name="search",
             description=_SEARCH_DESCRIPTION,
             parameters=_SEARCH_PARAMETERS,
         )
         self.api_key = api_key
-        self.cx = cx
-        self.snippet_max_tokens = snippet_max_tokens
-        self._api_url = "https://www.googleapis.com/customsearch/v1"
-        self._encoding = tiktoken.get_encoding("cl100k_base")
-        self._docid_counter = 0
 
     # ------------------------------------------------------------------
     # helpers
     # ------------------------------------------------------------------
 
-    def _truncate(self, text: str) -> str:
-        tokens = self._encoding.encode(text)
-        if len(tokens) <= self.snippet_max_tokens:
-            return text
-        return self._encoding.decode(tokens[: self.snippet_max_tokens])
+    @staticmethod
+    def _is_chinese(text: str) -> bool:
+        return any("\u4e00" <= c <= "\u9fff" for c in text)
 
-    def _next_docid(self) -> int:
-        self._docid_counter += 1
-        return self._docid_counter
+    def _single_search(self, query: str) -> str:
+        payload = {"q": query}
+        if self._is_chinese(query):
+            payload.update({"location": "China", "gl": "cn", "hl": "zh-cn"})
+        else:
+            payload.update({"location": "United States", "gl": "us", "hl": "en"})
 
-    def _domain(self, url: str) -> str:
-        return urlparse(url).netloc or url
+        headers = {"X-API-KEY": self.api_key, "Content-Type": "application/json"}
 
-    def _raw_search(self, query: str, timeout: int = 20) -> dict:
-        params = {"q": query, "key": self.api_key, "cx": self.cx}
-        for attempt in range(1, 4):
-            try:
-                resp = requests.get(self._api_url, params=params, timeout=timeout)
-                resp.raise_for_status()
-                return resp.json()
-            except Timeout:
-                if attempt == 3:
-                    print(f"[SearchTool] Timeout for query: {query!r} after 3 retries")
-                    return {}
-                print(f"[SearchTool] Timeout, retrying ({attempt}/3)...")
-            except requests.exceptions.RequestException as e:
-                if attempt == 3:
-                    print(f"[SearchTool] Request error: {e} after 3 retries")
-                    return {}
-                print(f"[SearchTool] Request error: {e}, retrying ({attempt}/3)...")
-            time.sleep(1)
-        return {}
+        try:
+            resp = requests.post(
+                self._SERPER_URL, headers=headers, json=payload, timeout=(3, 10)
+            )
+            resp.raise_for_status()
+            results = resp.json()
+        except Exception as e:
+            return f"Google search failed for '{query}'. Error: {e}"
+
+        if "organic" not in results:
+            return f"No organic results found for query: '{query}'."
+
+        try:
+            snippets = []
+            for idx, page in enumerate(results["organic"], 1):
+                date_published = f"\nDate published: {page['date']}" if "date" in page else ""
+                source = f"\nSource: {page['source']}" if "source" in page else ""
+                snippet = f"\n{page['snippet']}" if "snippet" in page else ""
+                link = page.get("link", "")
+                title = page.get("title", "No Title")
+                entry = f"{idx}. [{title}]({link}){date_published}{source}{snippet}"
+                entry = entry.replace("Your browser can't play this video.", "")
+                snippets.append(entry)
+
+            return (
+                f"A Google search for '{query}' found {len(snippets)} results:\n\n"
+                f"## Web Results\n" + "\n\n".join(snippets)
+            )
+        except Exception as e:
+            return f"Error parsing results for '{query}'. {e}"
 
     # ------------------------------------------------------------------
     # execute
     # ------------------------------------------------------------------
 
-    def execute(self, query: str) -> str:
-        data = self._raw_search(query)
+    def execute(self, query) -> str:
+        if isinstance(query, str):
+            queries = [query]
+        elif isinstance(query, list):
+            queries = query
+        else:
+            return "[SearchTool] Invalid query format: expected string or array."
 
-        if not data or "items" not in data:
-            return f"[SearchTool] No results for query: {query!r}"
+        results_map: dict[str, str] = {}
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            future_to_query = {
+                executor.submit(self._single_search, q): q for q in queries
+            }
+            for future in as_completed(future_to_query):
+                q = future_to_query[future]
+                try:
+                    results_map[q] = future.result()
+                except Exception as e:
+                    results_map[q] = f"Search failed: {e}"
 
-        lines = [f'Search results for: "{query}"\n']
-        seen_urls: set[str] = set()
-
-        for item in data.get("items", []):
-            url = item.get("link", "")
-            if not url or url in seen_urls:
-                continue
-            seen_urls.add(url)
-
-            docid = self._next_docid()
-            domain = self._domain(url)
-            snippet = self._truncate(item.get("snippet", ""))
-            title = item.get("title", "")
-
-            lines.append(
-                f"[{docid}] {title}\n"
-                f"    Source: {domain}\n"
-                f"    Snippet: {snippet}\n"
-            )
-
-        return "\n".join(lines)
+        return "\n=======\n".join(results_map.get(q, "Error") for q in queries)
