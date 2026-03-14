@@ -2,6 +2,7 @@ import copy
 import json
 import os
 import time
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
@@ -53,6 +54,47 @@ class RunState:
     @property
     def elapsed(self) -> float:
         return time.time() - self.start_time
+
+
+class ContextManager(ABC):
+    """可插拔的消息上下文处理器基类。
+
+    在每次 LLM 调用前，按注册顺序依次处理完整的 messages 列表（含 system 消息），
+    可用于实现以下功能（接口预留，具体逻辑由子类实现）：
+        - token budget:       统计 token 数，超出预算时截断或压缩历史。
+        - history trim:       按轮数或时间窗口剪裁旧消息。
+        - message rebuild:    重新格式化消息结构（如合并多轮 tool 消息）。
+        - truncation notice:  在截断位置注入占位消息，告知模型历史已被截断。
+
+    与 Hook 的区别：
+        Hook (before_llm/after_llm/...)  是轻量级事件回调，observe/react，无返回值。
+        ContextManager                   是消息变换管道，接收完整 messages 并返回变换结果。
+
+    执行顺序（每次 LLM 调用前）：
+        1. _apply_context_managers(messages)  → 依次经过所有 ContextManager
+        2. _fire("before_llm", state, ...)    → 触发 before_llm hook（看到处理后的消息）
+        3. client.chat.completions.create()   → 实际 LLM 调用
+    """
+
+    @abstractmethod
+    def process(self, messages: list[dict], state: "RunState") -> list[dict]:
+        """对完整 messages 列表进行变换，返回处理后的版本。
+
+        Args:
+            messages: 当前完整消息列表，第一条为 system 消息，其余按时序排列。
+            state:    当前 RunState，可读取 step / tool_rounds / elapsed 等信息。
+
+        Returns:
+            变换后的 messages 列表，将直接传递给下一个 ContextManager 或 LLM。
+            若无需修改，直接返回原列表即可。
+        """
+        raise NotImplementedError
+
+    def reset(self) -> None:
+        """每次 run() 开始时调用，用于重置有状态的 ContextManager。
+
+        默认无操作；有内部状态（如 token 计数器、已处理轮数）的子类应覆盖此方法。
+        """
 
 
 @dataclass
@@ -108,6 +150,9 @@ class BaseAgent:
             "should_stop":  [],   # (state)            -> Optional[str]
         }
 
+        # ContextManager 链，按注册顺序依次处理消息
+        self._context_managers: list[ContextManager] = []
+
     # ------------------------------------------------------------------
     # Hook 注册 API
     # ------------------------------------------------------------------
@@ -141,6 +186,29 @@ class BaseAgent:
                 return result
         return None
 
+    # ------------------------------------------------------------------
+    # ContextManager 注册 API
+    # ------------------------------------------------------------------
+
+    def use(self, cm: ContextManager) -> "BaseAgent":
+        """注册一个 ContextManager，返回 self 支持链式调用。
+
+        ContextManager 按注册顺序形成管道，每次 LLM 调用前依次处理消息列表。
+        消息列表包含 system 消息（第一条），随后是完整对话历史。
+
+        示例：
+            agent.use(TokenBudgetManager(max_tokens=4096))
+                 .use(TruncationNoticeManager(notice="[历史已截断]"))
+        """
+        self._context_managers.append(cm)
+        return self
+
+    def _apply_context_managers(self, messages: list[dict]) -> list[dict]:
+        """将 messages 依次传过所有已注册的 ContextManager，返回最终结果。"""
+        for cm in self._context_managers:
+            messages = cm.process(messages, self.state)
+        return messages
+
     def _use_native_tools(self) -> bool:
         return False
 
@@ -156,7 +224,8 @@ class BaseAgent:
         return base or None
 
     def _call_llm(self):
-        messages = [{"role": "system", "content": self.system_prompt}] + self.messages
+        raw_messages = [{"role": "system", "content": self.system_prompt}] + self.messages
+        messages = self._apply_context_managers(raw_messages)
         cfg = self.llm_config
 
         kwargs: dict = {
@@ -244,6 +313,8 @@ class BaseAgent:
         self.messages = []
         self.trajectory = []
         self.state = RunState()
+        for cm in self._context_managers:
+            cm.reset()
         self.messages.append({"role": "user", "content": user_input})
 
         for step_idx in range(self.max_steps):
