@@ -5,8 +5,8 @@ LocalVisitTool - 基于本地语料库缓存 + vllm LLM API 的离线文档访�
 - 仅支持通过 docid（LocalSearchTool 搜索后返回的会话整数 ID）访问文档
 - 文档内容直接从 LocalSearchTool 的内存缓存读取，不走任何在线接口
 - docid 无效（未搜索过或不存在）时直接返回错误，不做保底降级
-- 提供可选的 goal 参数：传入时调用本地 vllm LLM API 抽取 evidence/summary；
-  不传时直接返回原始语料文本
+- 支持单个 docid 或 docid 数组，共用同一个 goal 批量提取
+- goal 为必填参数，始终调用本地 vllm LLM API 根据 goal 抽取 evidence/summary
 
 初始化参数：
     llm_api_key:  vllm LLM API 密钥（本地部署通常为 "EMPTY"）
@@ -25,21 +25,23 @@ _LOCAL_VISIT_PARAMETERS = {
     "type": "object",
     "properties": {
         "docid": {
-            "type": "integer",
-            "description": "The docid of the search result to open (returned by the search tool)",
+            "type": "array",
+            "items": {"type": "integer"},
+            "minItems": 1,
+            "description": "Array of docids to open (returned by the search tool)",
         },
         "goal": {
             "type": "string",
-            "description": "The specific information goal; the LLM extracts targeted evidence when provided",
+            "description": "The specific information goal; the LLM extracts targeted evidence based on this goal",
         },
     },
-    "required": ["docid"],
+    "required": ["docid", "goal"],
 }
 
 _LOCAL_VISIT_DESCRIPTION = (
-    "Opens a document from the local corpus by its docid (returned by the search tool) "
-    "and returns its full content. Optionally supply 'goal' to have an auxiliary LLM "
-    "extract the most relevant evidence for that goal."
+    "Opens one or more documents from the local corpus by their docid(s) (returned by "
+    "the search tool) and extracts the most relevant evidence for the given goal using "
+    "an auxiliary LLM. Supply a single integer or an array of integers for 'docid'."
 )
 
 
@@ -61,7 +63,7 @@ class LocalVisitTool(BaseTool):
         max_content_chars: Maximum characters of corpus text sent to the LLM.
     """
 
-    MAX_CONTENT_CHARS = 100_000
+    MAX_CONTENT_CHARS = 100000
 
     def __init__(
         self,
@@ -119,19 +121,22 @@ class LocalVisitTool(BaseTool):
     # execute
     # ------------------------------------------------------------------
 
-    def execute(self, docid: int, goal: str = "") -> str:
-        text = self.search_tool.get_text_by_docid(docid)
-        if text is None:
-            return (
-                f"[LocalVisitTool] docid {docid} not found in corpus cache. "
-                "Make sure to run a search first and use a docid from the results."
-            )
+    def execute(self, docid, goal: str) -> str:
+        docids = docid
 
-        url = self.search_tool.get_url_by_docid(docid) or ""
-        content = text[: self.max_content_chars]
+        results = []
+        for did in docids:
+            text = self.search_tool.get_text_by_docid(did)
+            if text is None:
+                results.append(
+                    f"[LocalVisitTool] docid {did} not found in corpus cache. "
+                    "Make sure to run a search first and use a docid from the results."
+                )
+                continue
 
-        if not goal:
-            return f"URL: {url}\n\n{content}"
+            url = self.search_tool.get_url_by_docid(did) or ""
+            content = text[: self.max_content_chars]
+            evidence = self._extract_evidence(content, goal)
+            results.append(f"URL: {url}\nEvidence:\n{evidence}")
 
-        evidence = self._extract_evidence(content, goal)
-        return f"URL: {url}\nEvidence:\n{evidence}"
+        return "\n=======\n".join(results)

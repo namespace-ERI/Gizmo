@@ -32,17 +32,22 @@ _LOCAL_SEARCH_PARAMETERS = {
     "type": "object",
     "properties": {
         "query": {
-            "type": "string",
-            "description": "The search query string",
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "Array of query strings. "
+                "Include multiple complementary search queries in a single call."
+            ),
         }
     },
     "required": ["query"],
 }
 
 _LOCAL_SEARCH_DESCRIPTION = (
-    "Performs a search over a local corpus index. The tool retrieves the top results "
-    "for the query, returning their docid (temporary index, keep unique in the main "
-    "session), source domain, and document snippet (may be truncated based on token limits)."
+    "Performs batched search over a local corpus index: supply an array 'query'; "
+    "the tool retrieves the top results for each query in one call, returning their "
+    "docid (temporary index, keep unique in the main session), source domain, and "
+    "document snippet (may be truncated based on token limits)."
 )
 
 # Qwen3-Embedding query instruction prefix
@@ -182,15 +187,8 @@ class LocalSearchTool(BaseTool):
     # execute
     # ------------------------------------------------------------------
 
-    def execute(self, query: str) -> str:
-        self._load()
-        query = query.replace('"', "")
-
-        try:
-            q_emb = self._embed_queries([query])
-        except Exception as e:
-            return f"[LocalSearchTool] Embedding API error: {e}"
-
+    def _search_single(self, query: str, q_emb: np.ndarray) -> str:
+        """对单条 query 的 embedding 做 FAISS 检索并格式化结果。"""
         scores, indices = self._index.search(q_emb, self.top_k)
 
         lines = [f'Search results for: "{query}"\n']
@@ -218,3 +216,27 @@ class LocalSearchTool(BaseTool):
         if len(lines) == 1:
             return f"[LocalSearchTool] No results for query: {query!r}"
         return "\n".join(lines)
+
+    def execute(self, query) -> str:
+        self._load()
+
+        if isinstance(query, str):
+            queries = [query]
+        elif isinstance(query, list):
+            queries = query
+        else:
+            return "[LocalSearchTool] Invalid query format: expected string or array."
+
+        queries = [q.replace('"', "") for q in queries]
+
+        try:
+            # 所有 query 一次批量发给 embedding API
+            q_embs = self._embed_queries(queries)
+        except Exception as e:
+            return f"[LocalSearchTool] Embedding API error: {e}"
+
+        results = [
+            self._search_single(q, q_embs[i : i + 1])
+            for i, q in enumerate(queries)
+        ]
+        return "\n=======\n".join(results)

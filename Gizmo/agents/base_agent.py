@@ -1,13 +1,58 @@
+import copy
 import json
 import os
+import time
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
 
 from openai import OpenAI
 
 """
     对所有Agent的基类，提供了LLM调用、工具调用、解析响应、执行工具等基本功能。不同厂商的template不同所以为了适配不同模型，需要重写一些方法。
 """
+
+
+@dataclass
+class LLMConfig:
+    """LLM 调用的生成参数配置。
+
+    Attributes:
+        max_tokens:       最大输出 token 数。
+        temperature:      采样温度。
+        seed:             随机种子，用于复现。
+        timeout:          HTTP 请求超时（秒），同时作为 OpenAI 客户端超时。
+        enable_thinking:  是否开启 vllm thinking 模式（通过 extra_body 注入
+                          chat_template_kwargs.enable_thinking=True）。
+        extra_body:       透传给 OpenAI API 的额外请求体字段（如 vllm 扩展参数），
+                          与 enable_thinking 产生的字段深度合并。
+    """
+    max_tokens: Optional[int] = None
+    temperature: Optional[float] = None
+    seed: Optional[int] = None
+    timeout: float = 120.0
+    enable_thinking: bool = False
+    extra_body: Optional[dict] = None
+
+
+@dataclass
+class RunState:
+    """单次 run() 的运行状态，每次调用 run/run_verbose 时重置。
+
+    Attributes:
+        step:         当前已完成的 LLM 调用轮数（含最终回答轮）。
+        tool_rounds:  调用了工具的轮数。
+        elapsed:      距本次 run 开始经过的秒数（实时更新）。
+        stop_reason:  停止原因："" 表示正常结束，否则为 "max_steps" /
+                      "timeout" / "max_tool_rounds"。
+    """
+    step: int = 0
+    tool_rounds: int = 0
+    start_time: float = field(default_factory=time.time)
+    stop_reason: str = ""
+
+    @property
+    def elapsed(self) -> float:
+        return time.time() - self.start_time
 
 
 @dataclass
@@ -34,31 +79,101 @@ class BaseAgent:
         system_prompt: str = "You are a helpful assistant.",
         tools: Optional[list] = None,
         max_steps: int = 200,
-        timeout: float = 120.0,
+        max_time_seconds: Optional[float] = None,
+        max_tool_rounds: Optional[int] = None,
+        llm_config: Optional[LLMConfig] = None,
     ):
         self.model = model
         self.system_prompt = system_prompt
         self.tools = {tool.name: tool for tool in (tools or [])}
         self.max_steps = max_steps
+        self.max_time_seconds = max_time_seconds
+        self.max_tool_rounds = max_tool_rounds
         self.messages: list[dict] = []
         self.trajectory: list[TrajectoryStep] = []
+        self.state: RunState = RunState()
+        self.llm_config = llm_config or LLMConfig()
 
         self.client = OpenAI(
             api_key=api_key,
             base_url=base_url,
-            timeout=timeout,
+            timeout=self.llm_config.timeout,
         )
+
+        # Hook 注册表，每个事件对应一组有序的回调函数
+        self._hooks: dict[str, list[Callable]] = {
+            "before_llm":   [],   # (state, messages) -> None
+            "after_llm":    [],   # (state, parsed)   -> None
+            "after_tool":   [],   # (state, tool_name, args, result) -> None
+            "should_stop":  [],   # (state)            -> Optional[str]
+        }
+
+    # ------------------------------------------------------------------
+    # Hook 注册 API
+    # ------------------------------------------------------------------
+
+    def on(self, event: str, fn: Callable) -> "BaseAgent":
+        """注册生命周期 hook，返回 self 支持链式调用。
+
+        事件说明：
+            before_llm(state, messages)           每次 LLM 调用前触发，可就地修改 messages。
+            after_llm(state, parsed)              每次 LLM 返回后触发，parsed 含 final_content /
+                                                  reasoning_content / tool_calls 等字段。
+            after_tool(state, name, args, result) 每次工具执行完毕后触发。
+            should_stop(state) -> Optional[str]   每轮循环开始时触发，返回非空字符串即触发停止；
+                                                  多个 hook 中第一个非空返回优先。
+
+        示例：
+            agent.on("after_llm", lambda s, p: print(p["reasoning_content"]))
+            agent.on("should_stop", lambda s: "custom" if s.step > 5 else None)
+        """
+        if event not in self._hooks:
+            raise ValueError(f"Unknown hook event: {event!r}. "
+                             f"Valid events: {list(self._hooks)}")
+        self._hooks[event].append(fn)
+        return self
+
+    def _fire(self, event: str, *args):
+        """触发某事件的所有 hook，收集 should_stop 的返回值。"""
+        for fn in self._hooks[event]:
+            result = fn(*args)
+            if event == "should_stop" and result:
+                return result
+        return None
 
     def _use_native_tools(self) -> bool:
         return False
 
+    def _build_extra_body(self) -> Optional[dict]:
+        """合并 enable_thinking 标志和用户自定义 extra_body。"""
+        cfg = self.llm_config
+        base = copy.deepcopy(cfg.extra_body) if cfg.extra_body else {}
+
+        if cfg.enable_thinking:
+            tmpl = base.setdefault("chat_template_kwargs", {})
+            tmpl["enable_thinking"] = True
+
+        return base or None
+
     def _call_llm(self):
         messages = [{"role": "system", "content": self.system_prompt}] + self.messages
+        cfg = self.llm_config
 
-        kwargs = {
+        kwargs: dict = {
             "model": self.model,
             "messages": messages,
         }
+
+        if cfg.max_tokens is not None:
+            kwargs["max_tokens"] = cfg.max_tokens
+        if cfg.temperature is not None:
+            kwargs["temperature"] = cfg.temperature
+        if cfg.seed is not None:
+            kwargs["seed"] = cfg.seed
+
+        extra_body = self._build_extra_body()
+        if extra_body:
+            kwargs["extra_body"] = extra_body
 
         if self._use_native_tools():
             tools = [tool.to_schema() for tool in self.tools.values()] or None
@@ -86,12 +201,60 @@ class BaseAgent:
     def _build_tool_result_messages(self, tool_name: str, tool_result: str) -> list[dict]:
         raise NotImplementedError
 
+    def _on_stop(self, stop_reason: str) -> Optional[str]:
+        """停止条件触发时注入的最后一轮用户消息，返回 None 则不注入。
+        子类可覆盖此方法自定义提示内容。"""
+        prompts = {
+            "max_steps":      "You have reached the maximum number of steps. Please provide your best answer now based on what you have found so far.",
+            "timeout":        "Time is running out. Please provide your best answer now based on what you have found so far.",
+            "max_tool_rounds": "You have used the maximum number of tool calls. Please provide your final answer now based on what you have gathered.",
+        }
+        return prompts.get(stop_reason)
+
+    def _check_stop(self) -> str:
+        """检查是否触发停止条件，返回停止原因字符串，未触发则返回空字符串。
+        内置条件 + should_stop hook 均会检查，hook 优先级低于内置条件。"""
+        if self.max_time_seconds and self.state.elapsed >= self.max_time_seconds:
+            return "timeout"
+        if self.max_tool_rounds is not None and self.state.tool_rounds >= self.max_tool_rounds:
+            return "max_tool_rounds"
+        hook_reason = self._fire("should_stop", self.state)
+        return hook_reason or ""
+
+    def _finalize(self, stop_reason: str) -> dict:
+        """触发停止条件后，可选注入提示并再调用一次 LLM 得到最终答案。"""
+        self.state.stop_reason = stop_reason
+        stop_msg = self._on_stop(stop_reason)
+        if stop_msg:
+            self.messages.append({"role": "user", "content": stop_msg})
+            resp = self._call_llm()
+            raw_content = resp.choices[0].message.content or ""
+            parsed = self._parse_response(raw_content)
+            self.messages.append(parsed["assistant_message"])
+            step = TrajectoryStep(
+                step=self.state.step + 1,
+                reasoning=parsed.get("reasoning_content", ""),
+                final_content=parsed.get("final_content", ""),
+            )
+            self.trajectory.append(step)
+            return parsed
+        return {"final_content": f"[stopped: {stop_reason}]", "reasoning_content": "", "tool_calls": []}
+
     def _run_loop(self, user_input: str) -> dict:
         self.messages = []
         self.trajectory = []
+        self.state = RunState()
         self.messages.append({"role": "user", "content": user_input})
 
         for step_idx in range(self.max_steps):
+            # 每轮 LLM 调用前检查停止条件
+            stop_reason = self._check_stop()
+            if stop_reason:
+                return self._finalize(stop_reason)
+
+            self.state.step = step_idx + 1
+
+            self._fire("before_llm", self.state, self.messages)
             resp = self._call_llm()
             msg = resp.choices[0].message
             raw_content = msg.content or ""
@@ -102,13 +265,15 @@ class BaseAgent:
             final_content = parsed["final_content"]
             reasoning = parsed.get("reasoning_content", "")
 
-            self.messages.append(assistant_message)
+            self._fire("after_llm", self.state, parsed)
 
-            step = TrajectoryStep(step=step_idx + 1, reasoning=reasoning)
+            self.messages.append(assistant_message)
+            step = TrajectoryStep(step=self.state.step, reasoning=reasoning)
 
             if not tool_calls:
                 step.final_content = final_content
                 self.trajectory.append(step)
+                self.state.stop_reason = ""
                 return parsed
 
             for tc in tool_calls:
@@ -119,13 +284,15 @@ class BaseAgent:
 
                 tool_result = self._execute_tool(tool_name, tool_args)
                 step.tool_calls.append(ToolCallRecord(name=tool_name, args=tool_args, result=tool_result))
+                self._fire("after_tool", self.state, tool_name, tool_args, tool_result)
 
                 for message in self._build_tool_result_messages(tool_name, tool_result):
                     self.messages.append(message)
 
+            self.state.tool_rounds += 1
             self.trajectory.append(step)
 
-        return {"final_content": "[reached max steps]", "reasoning_content": "", "tool_calls": []}
+        return self._finalize("max_steps")
 
     def run(self, user_input: str) -> str:
         parsed = self._run_loop(user_input)
@@ -137,6 +304,9 @@ class BaseAgent:
 
     def print_trajectory(self) -> None:
         """打印完整轨迹，便于调试。"""
+        s = self.state
+        print(f"\n[RunState] steps={s.step}  tool_rounds={s.tool_rounds}  "
+              f"elapsed={s.elapsed:.1f}s  stop_reason={s.stop_reason or 'normal'}")
         for step in self.trajectory:
             print(f"\n{'='*60}")
             print(f"Step {step.step}")
