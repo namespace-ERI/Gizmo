@@ -21,8 +21,7 @@ _SEARCH_PARAMETERS = {
             "type": "array",
             "items": {"type": "string"},
             "description": (
-                "Array of query strings. "
-                "Include multiple complementary search queries in a single call."
+                "A list of search queries."
             ),
         }
     },
@@ -30,8 +29,7 @@ _SEARCH_PARAMETERS = {
 }
 
 _SEARCH_DESCRIPTION = (
-    "Performs batched web searches: supply an array 'query'; "
-    "the tool retrieves the top 10 results for each query in one call."
+        "Performs batched web searches: supply an array 'query'; the tool retrieves the top 10 results for each query in one call."
 )
 
 

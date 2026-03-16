@@ -193,7 +193,6 @@ Reminder:
                 "role": "user",
                 "content": (
                     f"<tool_response>\n{tool_result}\n</tool_response>\n"
-                    f"Please continue."
                 ),
             }
         ]

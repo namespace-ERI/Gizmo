@@ -277,6 +277,7 @@ class BaseAgent:
             "max_steps":      "You have reached the maximum number of steps. Please provide your best answer now based on what you have found so far.",
             "timeout":        "Time is running out. Please provide your best answer now based on what you have found so far.",
             "max_tool_rounds": "You have used the maximum number of tool calls. Please provide your final answer now based on what you have gathered.",
+            "token_budget":   "The conversation has reached the context length limit. Please provide your best answer now based on what you have found so far.",
         }
         return prompts.get(stop_reason)
 

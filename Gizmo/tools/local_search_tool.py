@@ -4,14 +4,13 @@ LocalSearchTool - 基于本地 FAISS 索引 + vllm Embedding API 的离线语料
 功能：
 - FAISS 索引文件（corpus.index）和语料文本（.arrow 文件）从本地磁盘加载，懒加载、线程安全
 - Query 向量化通过远程 vllm Embedding API 完成，无需在本地加载 Embedding 模型
-- 使用会话级整数 docid（从 1 自增），可通过 get_url_by_docid / get_text_by_docid 反查
-- LocalVisitTool 依赖本工具的 docid → 全文 缓存，避免重复拉取
+- 搜索结果直接返回 URL，LocalVisitTool 通过 get_text_by_url() 反查全文
 
 初始化参数：
     index_path:    本地 FAISS 索引目录（含 corpus.index 和 corpus_lookup.pkl）
     corpus_path:   本地语料 .arrow 文件目录（HuggingFace Dataset 格式）
-    embed_api_url: vllm Embedding API 地址（如 http://localhost:8001/v1）
-    embed_model:   Embedding 模型名称（如 Qwen3-Embedding-0.6B）
+    embed_api_url: vllm Embedding API 地址（如 http://localhost:8002/v1）
+    embed_model:   Embedding 模型名称（如 Qwen3-Embedding-8B）
 """
 
 import pickle
@@ -33,21 +32,17 @@ _LOCAL_SEARCH_PARAMETERS = {
     "properties": {
         "query": {
             "type": "array",
-            "items": {"type": "string"},
-            "description": (
-                "Array of query strings. "
-                "Include multiple complementary search queries in a single call."
-            ),
-        }
+            "items": {
+                "type": "string"
+            },
+            "description": "Array of query strings. Include multiple complementary search queries in a single call."
+        },
     },
     "required": ["query"],
 }
 
 _LOCAL_SEARCH_DESCRIPTION = (
-    "Performs batched search over a local corpus index: supply an array 'query'; "
-    "the tool retrieves the top results for each query in one call, returning their "
-    "docid (temporary index, keep unique in the main session), source domain, and "
-    "document snippet (may be truncated based on token limits)."
+    "Performs batched web searches: supply an array 'query'; the tool retrieves the top 5 results for each query in one call."
 )
 
 # Qwen3-Embedding query instruction prefix
@@ -68,12 +63,13 @@ class LocalSearchTool(BaseTool):
     Args:
         index_path:         Directory containing corpus.index and corpus_lookup.pkl.
         corpus_path:        Directory containing corpus .arrow files (HuggingFace Dataset).
-        embed_api_url:      Base URL of the vllm embedding API (e.g. http://localhost:8001/v1).
-        embed_model:        Model name registered on vllm (e.g. "Qwen3-Embedding-0.6B").
+        embed_api_url:      Base URL of the vllm embedding API (e.g. http://localhost:8002/v1).
+        embed_model:        Model name registered on vllm (e.g. "Qwen3-Embedding-8B").
         embed_api_key:      API key (usually "EMPTY" for local vllm).
         query_prefix:       Instruction prefix prepended to each query before embedding.
         top_k:              Number of results to return per query.
         snippet_max_tokens: Maximum tokens for the displayed snippet.
+        get_text_by_url:    Look up the full text of any corpus URL for LocalVisitTool.
     """
 
     def __init__(
@@ -104,16 +100,11 @@ class LocalSearchTool(BaseTool):
 
         # Lazy-loaded resources
         self._index: Optional[faiss.Index] = None
-        self._lookup: Optional[list] = None          # [(docid, url), ...] by FAISS position
-        self._docid_to_text: Optional[dict] = None
-        self._docid_to_url: Optional[dict] = None
+        self._lookup: Optional[list] = None   # [(corpus_docid, url), ...] by FAISS position
+        self._corpus_docid_to_text: Optional[dict] = None
+        self._url_to_text: Optional[dict] = None   # full corpus URL → text map
         self._loaded = False
         self._load_lock = threading.Lock()
-
-        # Session-level docid counter (integer, unique per run)
-        self._docid_counter = 0
-        self._session_docid_to_corpus_docid: dict[int, str] = {}
-        self._session_docid_to_url: dict[int, str] = {}
 
     # ------------------------------------------------------------------
     # lazy loading
@@ -141,9 +132,9 @@ class LocalSearchTool(BaseTool):
                 for f in arrow_files
             ]
             full_dataset = concatenate_datasets(datasets)
-            self._docid_to_text = {row["docid"]: row["text"] for row in full_dataset}
-            self._docid_to_url = {row["docid"]: row["url"] for row in full_dataset}
-            print(f"  Corpus loaded: {len(self._docid_to_text)} documents")
+            self._corpus_docid_to_text = {row["docid"]: row["text"] for row in full_dataset}
+            self._url_to_text = {row["url"]: row["text"] for row in full_dataset}
+            print(f"  Corpus loaded: {len(self._corpus_docid_to_text)} documents")
 
             self._loaded = True
             print("[LocalSearchTool] Ready.")
@@ -168,20 +159,9 @@ class LocalSearchTool(BaseTool):
     def _domain(self, url: str) -> str:
         return urlparse(url).netloc or url
 
-    def _next_docid(self, corpus_docid: str, url: str) -> int:
-        self._docid_counter += 1
-        self._session_docid_to_corpus_docid[self._docid_counter] = corpus_docid
-        self._session_docid_to_url[self._docid_counter] = url
-        return self._docid_counter
-
-    def get_url_by_docid(self, docid: int) -> str | None:
-        return self._session_docid_to_url.get(docid)
-
-    def get_text_by_docid(self, docid: int) -> str | None:
-        corpus_docid = self._session_docid_to_corpus_docid.get(docid)
-        if corpus_docid is None:
-            return None
-        return self._docid_to_text.get(corpus_docid) if self._docid_to_text else None
+    def get_text_by_url(self, url: str) -> str | None:
+        """通过 URL 反查全文，覆盖语料库中所有文档（不限于本次搜索结果）。"""
+        return self._url_to_text.get(url) if self._url_to_text else None
 
     # ------------------------------------------------------------------
     # execute
@@ -192,24 +172,23 @@ class LocalSearchTool(BaseTool):
         scores, indices = self._index.search(q_emb, self.top_k)
 
         lines = [f'Search results for: "{query}"\n']
-        seen_corpus_docids: set[str] = set()
+        seen: set[str] = set()
 
         for rank in range(self.top_k):
             idx = int(indices[0][rank])
             if idx < 0:
                 continue
             corpus_docid, url = self._lookup[idx]
-            if corpus_docid in seen_corpus_docids:
+            if corpus_docid in seen:
                 continue
-            seen_corpus_docids.add(corpus_docid)
+            seen.add(corpus_docid)
 
-            full_text = self._docid_to_text.get(corpus_docid, "")
-            docid = self._next_docid(corpus_docid, url)
-            domain = self._domain(url)
+            full_text = self._corpus_docid_to_text.get(corpus_docid, "")
             snippet = self._truncate_snippet(full_text)
 
             lines.append(
-                f"[{docid}] Source: {domain}\n"
+                f"[{len(lines)}] URL: {url}\n"
+                f"    Source: {self._domain(url)}\n"
                 f"    Snippet: {snippet}\n"
             )
 

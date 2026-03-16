@@ -2,10 +2,10 @@
 LocalVisitTool - 基于本地语料库缓存 + vllm LLM API 的离线文档访问工具
 
 功能：
-- 仅支持通过 docid（LocalSearchTool 搜索后返回的会话整数 ID）访问文档
+- 仅支持通过 URL（LocalSearchTool 搜索后结果中的 URL）访问文档
 - 文档内容直接从 LocalSearchTool 的内存缓存读取，不走任何在线接口
-- docid 无效（未搜索过或不存在）时直接返回错误，不做保底降级
-- 支持单个 docid 或 docid 数组，共用同一个 goal 批量提取
+- URL 无效（未搜索过或不存在）时直接返回错误，不做保底降级
+- 支持单个 URL 或 URL 数组，共用同一个 goal 批量提取
 - goal 为必填参数，始终调用本地 vllm LLM API 根据 goal 抽取 evidence/summary
 
 初始化参数：
@@ -24,42 +24,40 @@ from openai import OpenAI
 _LOCAL_VISIT_PARAMETERS = {
     "type": "object",
     "properties": {
-        "docid": {
-            "type": "array",
-            "items": {"type": "integer"},
+        "url": {
+            "type": ["string", "array"],
+            "items": {
+                "type": "string"
+                },
             "minItems": 1,
-            "description": "Array of docids to open (returned by the search tool)",
-        },
-        "goal": {
-            "type": "string",
-            "description": "The specific information goal; the LLM extracts targeted evidence based on this goal",
-        },
+            "description": "The URL(s) of the webpage(s) to visit. Can be a single URL or an array of URLs."
     },
-    "required": ["docid", "goal"],
+    "goal": {
+            "type": "string",
+            "description": "The goal of the visit for webpage(s)."
+    }
+    },
+    "required": ["url", "goal"]
 }
 
 _LOCAL_VISIT_DESCRIPTION = (
-    "Opens one or more documents from the local corpus by their docid(s) (returned by "
-    "the search tool) and extracts the most relevant evidence for the given goal using "
-    "an auxiliary LLM. Supply a single integer or an array of integers for 'docid'."
+    "Visit webpage(s) and return the summary of the content."
 )
 
 
 class LocalVisitTool(BaseTool):
     """Visit tool backed purely by the local corpus cache (no Jina fallback).
 
-    Content is retrieved from the linked LocalSearchTool's in-memory corpus store.
-    If the docid is not found, an error is returned immediately.
-
-    Optionally, supply a 'goal' to trigger LLM-based evidence extraction via a
-    vllm-compatible OpenAI API.
+    Content is retrieved by URL from the linked LocalSearchTool's in-memory corpus
+    store. Only URLs that appeared in a prior search result are accessible; if the
+    URL is not found, an error is returned immediately.
 
     Args:
-        llm_api_key:    API key for the auxiliary LLM (usually "EMPTY" for local vllm).
-        llm_base_url:   Base URL of the vllm LLM API.
-        llm_model:      Model name to use for evidence extraction.
-        search_tool:    The LocalSearchTool instance whose corpus cache is used.
-        llm_max_retries: Number of retries on LLM call failure.
+        llm_api_key:       API key for the auxiliary LLM (usually "EMPTY" for local vllm).
+        llm_base_url:      Base URL of the vllm LLM API.
+        llm_model:         Model name to use for evidence extraction.
+        search_tool:       The LocalSearchTool instance whose corpus cache is used.
+        llm_max_retries:   Number of retries on LLM call failure.
         max_content_chars: Maximum characters of corpus text sent to the LLM.
     """
 
@@ -121,22 +119,21 @@ class LocalVisitTool(BaseTool):
     # execute
     # ------------------------------------------------------------------
 
-    def execute(self, docid, goal: str) -> str:
-        docids = docid
+    def execute(self, url, goal: str) -> str:
+        urls = [url] if isinstance(url, str) else list(url)
 
         results = []
-        for did in docids:
-            text = self.search_tool.get_text_by_docid(did)
+        for u in urls:
+            text = self.search_tool.get_text_by_url(u)
             if text is None:
                 results.append(
-                    f"[LocalVisitTool] docid {did} not found in corpus cache. "
-                    "Make sure to run a search first and use a docid from the results."
+                    f"[LocalVisitTool] URL not found in corpus cache: {u!r}. "
+                    "Make sure to run a search first and use a URL from the search results."
                 )
                 continue
 
-            url = self.search_tool.get_url_by_docid(did) or ""
             content = text[: self.max_content_chars]
             evidence = self._extract_evidence(content, goal)
-            results.append(f"URL: {url}\nEvidence:\n{evidence}")
+            results.append(f"URL: {u}\nEvidence:\n{evidence}")
 
         return "\n=======\n".join(results)
