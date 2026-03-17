@@ -85,8 +85,9 @@ class ContextManager(ABC):
             state:    当前 RunState，可读取 step / tool_rounds / elapsed 等信息。
 
         Returns:
-            变换后的 messages 列表，将直接传递给下一个 ContextManager 或 LLM。
-            若无需修改，直接返回原列表即可。
+        变换后的 messages 列表，将直接传递给下一个 ContextManager 或 LLM。
+            若无需修改，直接返回原列表即可。返回结果会在真正发起 LLM 请求前
+            同步回写到 agent 的内部 messages 状态中。
         """
         raise NotImplementedError
 
@@ -209,6 +210,18 @@ class BaseAgent:
             messages = cm.process(messages, self.state)
         return messages
 
+    def _persist_processed_messages(self, messages: list[dict]) -> None:
+        """将 ContextManager 处理后的完整消息列表同步回内部状态。"""
+        if not messages:
+            self.messages = []
+            return
+
+        if messages[0].get("role") == "system":
+            self.messages = list(messages[1:])
+            return
+
+        self.messages = list(messages)
+
     def _use_native_tools(self) -> bool:
         return False
 
@@ -226,6 +239,7 @@ class BaseAgent:
     def _call_llm(self):
         raw_messages = [{"role": "system", "content": self.system_prompt}] + self.messages
         messages = self._apply_context_managers(raw_messages)
+        self._persist_processed_messages(messages)
         cfg = self.llm_config
 
         kwargs: dict = {

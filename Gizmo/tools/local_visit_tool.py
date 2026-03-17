@@ -73,7 +73,7 @@ class LocalVisitTool(BaseTool):
         max_content_chars: int = MAX_CONTENT_CHARS,
     ):
         super().__init__(
-            name="open_page",
+            name="visit",
             description=_LOCAL_VISIT_DESCRIPTION,
             parameters=_LOCAL_VISIT_PARAMETERS,
         )
@@ -120,7 +120,10 @@ class LocalVisitTool(BaseTool):
     # ------------------------------------------------------------------
 
     def execute(self, url, goal: str) -> str:
-        urls = [url] if isinstance(url, str) else list(url)
+        try:
+            urls = self.coerce_str_list(url, field_name="url", extract_urls=True)
+        except ValueError as e:
+            return f"[LocalVisitTool] {e}"
 
         results = []
         for u in urls:

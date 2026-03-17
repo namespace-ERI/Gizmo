@@ -71,7 +71,7 @@ class VisitTool(BaseTool):
         llm_max_retries: int = 1,
     ):
         super().__init__(
-            name="open_page",
+            name="visit",
             description=_VISIT_DESCRIPTION,
             parameters=_VISIT_PARAMETERS,
         )
@@ -192,7 +192,10 @@ class VisitTool(BaseTool):
     # ------------------------------------------------------------------
 
     def execute(self, url, goal: str) -> str:
-        urls = [url] if isinstance(url, str) else url
+        try:
+            urls = self.coerce_str_list(url, field_name="url", extract_urls=True)
+        except ValueError as e:
+            return f"[VisitTool] {e}"
 
         responses = []
         start = time.time()

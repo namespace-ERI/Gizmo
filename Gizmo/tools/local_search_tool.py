@@ -199,14 +199,10 @@ class LocalSearchTool(BaseTool):
     def execute(self, query) -> str:
         self._load()
 
-        if isinstance(query, str):
-            queries = [query]
-        elif isinstance(query, list):
-            queries = query
-        else:
-            return "[LocalSearchTool] Invalid query format: expected string or array."
-
-        queries = [q.replace('"', "") for q in queries]
+        try:
+            queries = self.coerce_str_list(query, field_name="query")
+        except ValueError as e:
+            return f"[LocalSearchTool] {e}"
 
         try:
             # 所有 query 一次批量发给 embedding API

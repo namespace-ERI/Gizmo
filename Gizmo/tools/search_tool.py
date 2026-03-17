@@ -99,12 +99,10 @@ class SearchTool(BaseTool):
     # ------------------------------------------------------------------
 
     def execute(self, query) -> str:
-        if isinstance(query, str):
-            queries = [query]
-        elif isinstance(query, list):
-            queries = query
-        else:
-            return "[SearchTool] Invalid query format: expected string or array."
+        try:
+            queries = self.coerce_str_list(query, field_name="query")
+        except ValueError as e:
+            return f"[SearchTool] {e}"
 
         results_map: dict[str, str] = {}
         with ThreadPoolExecutor(max_workers=5) as executor:
