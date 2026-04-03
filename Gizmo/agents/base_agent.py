@@ -18,21 +18,56 @@ class LLMConfig:
     """LLM 调用的生成参数配置。
 
     Attributes:
-        max_tokens:       最大输出 token 数。
+        max_tokens:       最大输出 token 数（chat.completions 兼容字段；GPTAgent
+                          会回退为 Responses API 的 max_output_tokens）。
+        max_output_tokens: Responses API 最大输出 token 数。
         temperature:      采样温度。
+        top_p:            nucleus sampling 参数。
         seed:             随机种子，用于复现。
         timeout:          HTTP 请求超时（秒），同时作为 OpenAI 客户端超时。
         enable_thinking:  是否开启 vllm thinking 模式（通过 extra_body 注入
                           chat_template_kwargs.enable_thinking=True）。
         extra_body:       透传给 OpenAI API 的额外请求体字段（如 vllm 扩展参数），
                           与 enable_thinking 产生的字段深度合并。
+        store:            Responses API store 字段。
+        truncation:       Responses API truncation 字段。
+        parallel_tool_calls: Responses API parallel_tool_calls 字段。
+        tool_choice:      Responses API tool_choice 字段。
+        reasoning:        Responses API reasoning 对象。
+        reasoning_effort: Responses API reasoning.effort 字段。
+        reasoning_summary: Responses API reasoning.summary 字段。
+        text:             Responses API text 对象。
+        text_verbosity:   Responses API text.verbosity 字段。
+        text_format:      Responses API text.format 字段。
+        include:          Responses API include 字段。
+        metadata:         Responses API metadata 字段。
+        service_tier:     Responses API service_tier 字段。
+        prompt_cache_key: Responses API prompt_cache_key 字段。
+        safety_identifier: Responses API safety_identifier 字段。
     """
     max_tokens: Optional[int] = None
+    max_output_tokens: Optional[int] = None
     temperature: Optional[float] = None
+    top_p: Optional[float] = None
     seed: Optional[int] = None
     timeout: float = 120.0
     enable_thinking: bool = False
     extra_body: Optional[dict] = None
+    store: Optional[bool] = None
+    truncation: Optional[str] = None
+    parallel_tool_calls: Optional[bool] = None
+    tool_choice: Optional[object] = None
+    reasoning: Optional[dict] = None
+    reasoning_effort: Optional[str] = None
+    reasoning_summary: Optional[str] = None
+    text: Optional[dict] = None
+    text_verbosity: Optional[str] = None
+    text_format: Optional[dict] = None
+    include: Optional[list[str]] = None
+    metadata: Optional[dict] = None
+    service_tier: Optional[str] = None
+    prompt_cache_key: Optional[str] = None
+    safety_identifier: Optional[str] = None
 
 
 @dataclass
@@ -114,6 +149,9 @@ class TrajectoryStep:
 
 
 class BaseAgent:
+    _PARSE_RETRY_LIMIT = 1
+    _FINALIZE_FOLLOWUP_LIMIT = 4
+
     def __init__(
         self,
         model: str,
@@ -236,9 +274,14 @@ class BaseAgent:
 
         return base or None
 
+    def _prepare_messages_for_llm(self, messages: list[dict]) -> list[dict]:
+        """子类可在真正发起请求前校验或规范化消息列表。"""
+        return messages
+
     def _call_llm(self):
         raw_messages = [{"role": "system", "content": self.system_prompt}] + self.messages
         messages = self._apply_context_managers(raw_messages)
+        messages = self._prepare_messages_for_llm(messages)
         self._persist_processed_messages(messages)
         cfg = self.llm_config
 
@@ -284,6 +327,33 @@ class BaseAgent:
     def _build_tool_result_messages(self, tool_name: str, tool_result: str) -> list[dict]:
         raise NotImplementedError
 
+    def _should_retry_parsed_response(self, parsed: dict) -> tuple[bool, str]:
+        if parsed.get("retryable"):
+            return True, str(parsed.get("retry_reason") or "retryable_parse")
+        return False, ""
+
+    @staticmethod
+    def _log_retry(reason: str, *, phase: str = "run") -> None:
+        print(f"[Recovery] {phase}: {reason}. Retrying with same context.")
+
+    def _execute_parsed_tool_calls(self, step: TrajectoryStep, tool_calls: list[dict]) -> None:
+        for tc in tool_calls:
+            tool_name = tc["function"]["name"]
+            tool_args = tc["function"].get("arguments", {})
+            if not isinstance(tool_args, dict):
+                tool_args = {}
+
+            tool_result = self._execute_tool(tool_name, tool_args)
+            step.tool_calls.append(
+                ToolCallRecord(name=tool_name, args=tool_args, result=tool_result)
+            )
+            self._fire("after_tool", self.state, tool_name, tool_args, tool_result)
+
+            for message in self._build_tool_result_messages(tool_name, tool_result):
+                self.messages.append(message)
+
+        self.state.tool_rounds += 1
+
     def _on_stop(self, stop_reason: str) -> Optional[str]:
         """停止条件触发时注入的最后一轮用户消息，返回 None 则不注入。
         子类可覆盖此方法自定义提示内容。"""
@@ -309,19 +379,42 @@ class BaseAgent:
         """触发停止条件后，可选注入提示并再调用一次 LLM 得到最终答案。"""
         self.state.stop_reason = stop_reason
         stop_msg = self._on_stop(stop_reason)
-        if stop_msg:
-            self.messages.append({"role": "user", "content": stop_msg})
+        if not stop_msg:
+            return {"final_content": f"[stopped: {stop_reason}]", "reasoning_content": "", "tool_calls": []}
+
+        self.messages.append({"role": "user", "content": stop_msg})
+        retry_budget = self._PARSE_RETRY_LIMIT
+
+        for _ in range(self._FINALIZE_FOLLOWUP_LIMIT):
+            self.state.step += 1
+            self._fire("before_llm", self.state, self.messages)
             resp = self._call_llm()
             raw_content = resp.choices[0].message.content or ""
             parsed = self._parse_response(raw_content)
+            self._fire("after_llm", self.state, parsed)
+
+            should_retry, retry_reason = self._should_retry_parsed_response(parsed)
+            if should_retry and retry_budget > 0:
+                retry_budget -= 1
+                self._log_retry(retry_reason, phase="finalize")
+                continue
+
+            retry_budget = self._PARSE_RETRY_LIMIT
             self.messages.append(parsed["assistant_message"])
             step = TrajectoryStep(
-                step=self.state.step + 1,
+                step=self.state.step,
                 reasoning=parsed.get("reasoning_content", ""),
-                final_content=parsed.get("final_content", ""),
             )
+
+            tool_calls = parsed["tool_calls"]
+            if not tool_calls:
+                step.final_content = parsed.get("final_content", "")
+                self.trajectory.append(step)
+                return parsed
+
+            self._execute_parsed_tool_calls(step, tool_calls)
             self.trajectory.append(step)
-            return parsed
+
         return {"final_content": f"[stopped: {stop_reason}]", "reasoning_content": "", "tool_calls": []}
 
     def _run_loop(self, user_input: str) -> dict:
@@ -332,13 +425,16 @@ class BaseAgent:
             cm.reset()
         self.messages.append({"role": "user", "content": user_input})
 
-        for step_idx in range(self.max_steps):
+        retry_budget = self._PARSE_RETRY_LIMIT
+        step_idx = 0
+        while step_idx < self.max_steps:
             # 每轮 LLM 调用前检查停止条件
             stop_reason = self._check_stop()
             if stop_reason:
                 return self._finalize(stop_reason)
 
-            self.state.step = step_idx + 1
+            step_idx += 1
+            self.state.step = step_idx
 
             self._fire("before_llm", self.state, self.messages)
             resp = self._call_llm()
@@ -353,6 +449,13 @@ class BaseAgent:
 
             self._fire("after_llm", self.state, parsed)
 
+            should_retry, retry_reason = self._should_retry_parsed_response(parsed)
+            if should_retry and retry_budget > 0:
+                retry_budget -= 1
+                self._log_retry(retry_reason)
+                continue
+
+            retry_budget = self._PARSE_RETRY_LIMIT
             self.messages.append(assistant_message)
             step = TrajectoryStep(step=self.state.step, reasoning=reasoning)
 
@@ -362,20 +465,7 @@ class BaseAgent:
                 self.state.stop_reason = ""
                 return parsed
 
-            for tc in tool_calls:
-                tool_name = tc["function"]["name"]
-                tool_args = tc["function"].get("arguments", {})
-                if not isinstance(tool_args, dict):
-                    tool_args = {}
-
-                tool_result = self._execute_tool(tool_name, tool_args)
-                step.tool_calls.append(ToolCallRecord(name=tool_name, args=tool_args, result=tool_result))
-                self._fire("after_tool", self.state, tool_name, tool_args, tool_result)
-
-                for message in self._build_tool_result_messages(tool_name, tool_result):
-                    self.messages.append(message)
-
-            self.state.tool_rounds += 1
+            self._execute_parsed_tool_calls(step, tool_calls)
             self.trajectory.append(step)
 
         return self._finalize("max_steps")

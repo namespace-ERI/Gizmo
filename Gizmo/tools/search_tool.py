@@ -1,10 +1,11 @@
 """
-SearchTool - 基于 Google Serper API 的在线搜索工具
+SearchTool - online search tool aligned with the BrowseComp reference path.
 
-功能：
-- 支持批量查询（query 为字符串数组），多个 query 并行执行
-- 自动检测中英文，切换对应的 location/gl/hl 参数
-- 返回每条结果的标题、链接、发布日期、来源和摘要
+Behavioral notes:
+- Uses the rag.ac.cn SERP proxy instead of the direct Serper endpoint.
+- Keeps the existing Gizmo tool schema: name is `search`, argument is `query`.
+- Accepts one or more queries and returns the same textual result format as the
+  reference implementation.
 """
 
 import time
@@ -20,23 +21,27 @@ _SEARCH_PARAMETERS = {
         "query": {
             "type": "array",
             "items": {"type": "string"},
-            "description": (
-                "A list of search queries."
-            ),
+            "description": "A list of search queries.",
         }
     },
     "required": ["query"],
 }
 
 _SEARCH_DESCRIPTION = (
-        "Performs batched web searches: supply an array 'query'; the tool retrieves the top 10 results for each query in one call."
+    "Performs batched web searches: supply an array 'query'; the tool retrieves "
+    "the top results for each query in one call."
 )
+
+_SERP_URL = "http://api2.rag.ac.cn/serp_search_v1"
+_MAX_SEARCH_RETRIES = 8
+
+
+class _RetryableSearchError(Exception):
+    pass
 
 
 class SearchTool(BaseTool):
-    """基于 Serper API 的批量 Google 搜索工具。"""
-
-    _SERPER_URL = "https://google.serper.dev/search"
+    """Batch Google search tool backed by the rag.ac.cn SERP proxy."""
 
     def __init__(self, api_key: str):
         super().__init__(
@@ -46,63 +51,111 @@ class SearchTool(BaseTool):
         )
         self.api_key = api_key
 
-    # ------------------------------------------------------------------
-    # helpers
-    # ------------------------------------------------------------------
-
     @staticmethod
     def _is_chinese(text: str) -> bool:
         return any("\u4e00" <= c <= "\u9fff" for c in text)
 
-    def _single_search(self, query: str) -> str:
-        payload = {"q": query}
+    @staticmethod
+    def _retry_delay(attempt: int) -> float:
+        return min(max(0.5 * (2 ** (attempt - 1)), 1.0), 5.0)
+
+    def _build_payload(self, query: str) -> dict:
+        payload = {
+            "query": query,
+            "page": 1,
+            "use_cache": True,
+            "token": self.api_key,
+            "search_type": "search",
+        }
         if self._is_chinese(query):
             payload.update({"location": "China", "gl": "cn", "hl": "zh-cn"})
         else:
             payload.update({"location": "United States", "gl": "us", "hl": "en"})
+        return payload
 
-        headers = {"X-API-KEY": self.api_key, "Content-Type": "application/json"}
+    def _request_results(self, query: str) -> dict:
+        headers = {"Content-Type": "application/json"}
+        payload = self._build_payload(query)
+        last_error: Exception | None = None
 
-        try:
-            resp = requests.post(
-                self._SERPER_URL, headers=headers, json=payload, timeout=(3, 10)
+        for attempt in range(1, _MAX_SEARCH_RETRIES + 1):
+            print(f"[Serper] Searching: {query} 1")
+            try:
+                resp = requests.post(
+                    _SERP_URL,
+                    json=payload,
+                    headers=headers,
+                    timeout=(5, 30),
+                )
+
+                if resp.status_code == 429 or resp.status_code >= 500:
+                    raise _RetryableSearchError(f"Server Error: {resp.status_code}")
+                if resp.status_code == 422:
+                    raise ValueError(f"URL Unprocessable by Serper: {query}")
+
+                data = resp.json()
+                if data == {"error": "Invalid or expired token"}:
+                    raise _RetryableSearchError("Server error: invalid or expired token")
+                if "organic" not in data:
+                    raise _RetryableSearchError("Error, No results found for query")
+                return data
+            except ValueError:
+                raise
+            except (requests.RequestException, _RetryableSearchError) as exc:
+                last_error = exc
+                if attempt == _MAX_SEARCH_RETRIES:
+                    break
+                print(f"Serper error, retry {attempt}/{_MAX_SEARCH_RETRIES}: {exc}")
+                time.sleep(self._retry_delay(attempt))
+            except Exception as exc:
+                last_error = exc
+                break
+
+        if last_error is None:
+            last_error = RuntimeError("Unknown search failure")
+        raise last_error
+
+    def _format_results(self, query: str, results: dict) -> str:
+        web_snippets: list[str] = []
+        for idx, page in enumerate(results["organic"], 1):
+            date_published = (
+                "\nDate published: " + str(page["date"]) if "date" in page else ""
             )
-            resp.raise_for_status()
-            results = resp.json()
-        except Exception as e:
-            return f"Google search failed for '{query}'. Error: {e}"
+            source = "\nSource: " + str(page["source"]) if "source" in page else ""
+            snippet = "\n" + str(page["snippet"]) if "snippet" in page else ""
+            title = str(page.get("title", "No Title"))
+            link = str(page.get("link", ""))
+            redacted = f"{idx}. [{title}]({link}){date_published}{source}\n{snippet}"
+            redacted = redacted.replace("Your browser can't play this video.", "")
+            web_snippets.append(redacted)
 
-        if "organic" not in results:
-            return f"No organic results found for query: '{query}'."
+        return (
+            f"A Google search for '{query}' found {len(web_snippets)} results:\n\n"
+            "## Web Results\n"
+            + "\n\n".join(web_snippets)
+        )
 
+    def _single_search(self, query: str) -> str:
         try:
-            snippets = []
-            for idx, page in enumerate(results["organic"], 1):
-                date_published = f"\nDate published: {page['date']}" if "date" in page else ""
-                source = f"\nSource: {page['source']}" if "source" in page else ""
-                snippet = f"\n{page['snippet']}" if "snippet" in page else ""
-                link = page.get("link", "")
-                title = page.get("title", "No Title")
-                entry = f"{idx}. [{title}]({link}){date_published}{source}{snippet}"
-                entry = entry.replace("Your browser can't play this video.", "")
-                snippets.append(entry)
-
-            return (
-                f"A Google search for '{query}' found {len(snippets)} results:\n\n"
-                f"## Web Results\n" + "\n\n".join(snippets)
-            )
-        except Exception as e:
-            return f"Error parsing results for '{query}'. {e}"
-
-    # ------------------------------------------------------------------
-    # execute
-    # ------------------------------------------------------------------
+            results = self._request_results(query)
+            if "organic" not in results:
+                return (
+                    f"No results found for query: '{query}'. "
+                    "Try with a more general query."
+                )
+            return self._format_results(query, results)
+        except ValueError:
+            print("Http Error. Retry next time.")
+            return "Http Error. Retry next time."
+        except Exception as exc:
+            print(f"Serper Error: {type(exc).__name__}: {exc}")
+            return f"Search Error: {type(exc).__name__}: {exc}"
 
     def execute(self, query) -> str:
         try:
             queries = self.coerce_str_list(query, field_name="query")
-        except ValueError as e:
-            return f"[SearchTool] {e}"
+        except ValueError as exc:
+            return f"[SearchTool] {exc}"
 
         results_map: dict[str, str] = {}
         with ThreadPoolExecutor(max_workers=5) as executor:
@@ -113,7 +166,7 @@ class SearchTool(BaseTool):
                 q = future_to_query[future]
                 try:
                     results_map[q] = future.result()
-                except Exception as e:
-                    results_map[q] = f"Search failed: {e}"
+                except Exception as exc:
+                    results_map[q] = f"Search Error: {type(exc).__name__}: {exc}"
 
         return "\n=======\n".join(results_map.get(q, "Error") for q in queries)

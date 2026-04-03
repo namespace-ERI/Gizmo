@@ -6,6 +6,15 @@ from Gizmo.prompts.system_prompt import QWEN_SYSTEM_PROMPT
 
 
 class QwenAgent(BaseAgent):
+    _TOOL_MARKERS = (
+        "<tool_call",
+        "</tool_call>",
+        "<function=",
+        "</function>",
+        "<parameter=",
+        "</parameter>",
+    )
+
     def __init__(self, *args, system_prompt: str = QWEN_SYSTEM_PROMPT, **kwargs):
         super().__init__(*args, system_prompt=system_prompt, **kwargs)
         self.system_prompt = self._build_system_prompt()
@@ -106,6 +115,21 @@ Reminder:
 
         return cleaned.strip()
 
+    @staticmethod
+    def _parse_parameter_value(raw_value: str):
+        value = (raw_value or "").strip()
+        if not value:
+            return ""
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return value
+
+    @classmethod
+    def _contains_tool_markup(cls, content: str) -> bool:
+        lowered = (content or "").lower()
+        return any(marker in lowered for marker in cls._TOOL_MARKERS)
+
     def _parse_tool_calls(self, content: str) -> list[dict]:
         content = (content or "").strip()
         if not content:
@@ -137,7 +161,7 @@ Reminder:
 
             arguments = {}
             for param_name, param_value in parameter_pattern.findall(function_body):
-                arguments[param_name.strip()] = param_value.strip()
+                arguments[param_name.strip()] = self._parse_parameter_value(param_value)
 
             results.append(
                 {
@@ -172,6 +196,9 @@ Reminder:
         tool_calls = self._parse_tool_calls(raw_content)
         reasoning_content = self._parse_reasoning_content(raw_content)
         final_content = self._extract_final_content(raw_content)
+        malformed_tool_call = not tool_calls and self._contains_tool_markup(raw_content)
+        if malformed_tool_call:
+            final_content = ""
 
         # 只保留标准 message 字段，避免非法字段传回 API
         # 同时保留 raw_content，让模型下一轮还能看到自己刚才的原始 <tool_call>
@@ -185,6 +212,8 @@ Reminder:
             "tool_calls": tool_calls,
             "reasoning_content": reasoning_content,
             "final_content": final_content,
+            "retryable": malformed_tool_call,
+            "retry_reason": "malformed_tool_call_xml" if malformed_tool_call else "",
         }
 
     def _build_tool_result_messages(self, tool_name: str, tool_result: str) -> list[dict]:

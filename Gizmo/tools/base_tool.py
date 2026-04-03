@@ -29,6 +29,19 @@ class BaseTool(ABC):
             },
         }
 
+    def to_response_schema(self, *, strict: Optional[bool] = None) -> dict:
+        schema = {
+            "type": "function",
+            "name": self.name,
+            "description": self.description,
+            "parameters": self.parameters,
+        }
+        if strict is None:
+            strict = getattr(self, "strict", None)
+        if strict is not None:
+            schema["strict"] = strict
+        return schema
+
     @staticmethod
     def _strip_wrapping_quotes(text: str) -> str:
         text = text.strip()

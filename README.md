@@ -1,9 +1,11 @@
 # Gizmo
 
-Gizmo is a lightweight agent framework for building tool-using research pipelines on top of OpenAI-compatible chat APIs. It provides:
+Gizmo is a lightweight agent framework for building tool-using research pipelines on top of OpenAI-compatible chat APIs and the OpenAI Responses API. It provides:
 
 - a reusable agent runtime with step limits, timeout limits, and trajectory recording
+- a `GPTAgent` adapter that talks to the official OpenAI Responses API with native function tools
 - a Qwen-oriented agent adapter that uses XML-style tool calls plus optional `<think>` reasoning blocks
+- a `GPTOssAgent` adapter aligned to the `gpt-oss` chat template served from vLLM
 - lifecycle hooks for injecting custom logic around each LLM/tool step
 - context-manager middleware for message rebuilding, truncation, token budgeting, and other pre-LLM transforms
 - built-in online and offline search/visit tools
@@ -24,11 +26,14 @@ The current design keeps the runtime generic and leaves task-specific strategy t
 
 ### Agent Adapters
 
+- `GPTAgent`: OpenAI Responses API adapter with native function calling
+- official function-tool schema and `function_call_output` reinjection
 - `QwenAgent`: prompt-based Qwen adapter
 - XML tool-call prompt construction
 - `<think>...</think>` reasoning extraction
 - prompt-based multi-tool parsing
 - tool-result reinjection as `<tool_response>...</tool_response>`
+- `GPTOssAgent`: native tool-calling adapter aligned to the `gpt-oss` chat template
 
 ### Built-in Tools
 
@@ -45,6 +50,8 @@ Gizmo/
   Gizmo/
     agents/
       base_agent.py
+      gpt_agent.py
+      gpt_oss_agent.py
       qwen_agent.py
     prompts/
       system_prompt.py
@@ -131,16 +138,30 @@ Use it for:
 
 ### `LLMConfig`
 
-`LLMConfig` controls OpenAI-compatible chat generation parameters:
+`LLMConfig` controls both OpenAI-compatible chat generation parameters and the Responses API fields consumed by `GPTAgent`:
 
 - `max_tokens`
+- `max_output_tokens`
 - `temperature`
+- `top_p`
 - `seed`
 - `timeout`
 - `enable_thinking`
 - `extra_body`
+- `store`
+- `truncation`
+- `parallel_tool_calls`
+- `tool_choice`
+- `reasoning` / `reasoning_effort` / `reasoning_summary`
+- `text` / `text_verbosity` / `text_format`
+- `include`
+- `metadata`
+- `service_tier`
+- `prompt_cache_key`
+- `safety_identifier`
 
 `enable_thinking=True` injects `chat_template_kwargs.enable_thinking=True` into `extra_body`.
+For `GPTAgent`, prefer the native Responses API knobs such as `max_output_tokens`, `parallel_tool_calls`, `reasoning_effort`, `reasoning_summary`, and `text_verbosity`.
 
 ### `ContextManager`
 
@@ -214,6 +235,33 @@ result = agent.run("Please call echo and return hello")
 print(result)
 agent.print_trajectory()
 agent.save_trajectory("logs/trajectory.json")
+```
+
+Official OpenAI Responses API example:
+
+```python
+from Gizmo.agents.base_agent import LLMConfig
+from Gizmo.agents.gpt_agent import GPTAgent
+from Gizmo.tools.echo_tool import EchoTool
+
+
+agent = GPTAgent(
+    model="gpt-5-mini",
+    api_key="YOUR_OPENAI_API_KEY",
+    tools=[EchoTool()],
+    max_steps=20,
+    llm_config=LLMConfig(
+        max_output_tokens=4096,
+        temperature=0.7,
+        parallel_tool_calls=True,
+        reasoning_effort="medium",
+        reasoning_summary="auto",
+        text_verbosity="medium",
+    ),
+)
+
+result = agent.run("Please call echo and return hello")
+print(result)
 ```
 
 ## Hook and Context Example
@@ -301,6 +349,24 @@ Tool results are fed back as:
 </tool_response>
 Please continue.
 ```
+
+## GPTAgent Behavior
+
+`GPTAgent` is the OpenAI-first adapter. It:
+
+- calls `client.responses.create(...)` instead of `chat.completions.create(...)`
+- sends the system prompt as Responses API `instructions`
+- converts runtime history into official Responses API `input` items
+- uses official function tools with top-level `type` / `name` / `description` / `parameters`
+- appends returned `response.output` items back into history for the next turn
+- sends local Python tool results back as `function_call_output` items
+- keeps the existing hook names, stop controls, trajectory recording, and `run()` / `run_verbose()` interface
+
+Compatibility notes:
+
+- `GPTAgent` history is stored as Responses API input items, not only as chat-style `role/content` messages.
+- `before_llm` hooks and `ContextManager`s still work, but they may now see a mixed list containing `message`, `function_call`, `reasoning`, and `function_call_output` items.
+- If a hook appends plain chat-style items such as `{"role": "user", "content": "..."}`, `GPTAgent` will normalize them into Responses API `message` items automatically.
 
 ## Built-in Tools
 
@@ -540,9 +606,12 @@ Returns the final assistant content as a string.
 Returns the parsed result dictionary, which may contain:
 
 - `assistant_message`
+- `output_items`
 - `tool_calls`
 - `reasoning_content`
 - `final_content`
+- `response_id`
+- `response_status`
 
 ### `trajectory`
 
@@ -555,14 +624,16 @@ Each completed step is recorded as a `TrajectoryStep` with:
 
 ### `save_trajectory(path)`
 
-Writes the full conversation messages as JSON, including the system prompt and all accumulated history.
+Writes the accumulated runtime history as JSON.
+For chat-style agents this is a message list with the system prompt; for `GPTAgent` it is a Responses-style payload with `instructions` and `input`.
 
 ## Current Limitations
 
 - `pyproject.toml` does not yet declare runtime dependencies.
-- Built-in package re-exports are minimal; most examples should import from concrete module paths such as `Gizmo.agents.base_agent` or `Gizmo.tools.search_tool`.
+- Tool re-exports are still minimal; importing from concrete module paths such as `Gizmo.agents.base_agent` or `Gizmo.tools.search_tool` remains the clearest option.
 - `QwenAgent` uses prompt-based XML tool calling, not OpenAI native tool calling.
 - `QwenAgent` does not currently deserialize XML parameter bodies into Python lists or dicts; structured tool args need a custom parser integration.
+- `GPTAgent` currently executes locally registered Python `function` tools; if you want hosted OpenAI tools such as web search or file search, wire them into your project flow explicitly.
 - No built-in memory manager is included in the package; memory, shared state, and context policies are expected to be implemented with hooks and context managers.
 - `mock_llm.py` is currently just a placeholder.
 
