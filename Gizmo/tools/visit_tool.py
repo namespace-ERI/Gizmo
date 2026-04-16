@@ -44,10 +44,36 @@ _VISIT_DESCRIPTION = "Visit webpage(s) and return the summary of the content."
 _MAX_CONTENT_TOKENS = 95_000
 _JINA_VISIT_URL = "http://api.rag.ac.cn/visit_pages_v1"
 _MAX_VISIT_RETRIES = 10
+_SUMMARIZER_MAX_OUTPUT_TOKENS = 8192
+_CONTEXT_TOKEN_SAFETY_MARGIN = 2048
+_CONTENT_REDUCTION_SAFETY_RATIO = 0.95
+_MIN_RETRY_CONTENT_TOKENS = 4096
+_MIN_RETRY_STEP_TOKENS = 2048
+_CONTEXT_LENGTH_RE = re.compile(
+    r"maximum context length is\s*(\d+)\s*tokens.*?request has\s*(\d+)\s*input tokens",
+    re.IGNORECASE | re.DOTALL,
+)
+_OUTPUT_TOKEN_RE = re.compile(r"too large:\s*(\d+)", re.IGNORECASE)
 
 
 class _RetryableVisitError(Exception):
     pass
+
+
+class _ContextLengthExceededError(Exception):
+    def __init__(
+        self,
+        *,
+        max_context_tokens: int,
+        input_tokens: int,
+        requested_output_tokens: int,
+        original_error: Exception,
+    ):
+        super().__init__(str(original_error))
+        self.max_context_tokens = max_context_tokens
+        self.input_tokens = input_tokens
+        self.requested_output_tokens = requested_output_tokens
+        self.original_error = original_error
 
 
 def _fail_response(url: str, goal: str) -> str:
@@ -72,6 +98,7 @@ class VisitTool(BaseTool):
         llm_base_url: str,
         llm_model: str,
         llm_max_retries: int = 3,
+        max_content_tokens: int = _MAX_CONTENT_TOKENS,
     ):
         super().__init__(
             name="visit",
@@ -83,16 +110,68 @@ class VisitTool(BaseTool):
         self._llm = OpenAI(api_key=llm_api_key, base_url=llm_base_url)
         self._llm_model = llm_model
         self._encoding = tiktoken.get_encoding("cl100k_base")
+        self.max_content_tokens = max(1, int(max_content_tokens))
 
     @staticmethod
     def _retry_delay(attempt: int) -> float:
         return min(max(1.0 * (2 ** (attempt - 1)), 2.0), 60.0)
 
-    def _truncate_tokens(self, text: str, max_tokens: int = _MAX_CONTENT_TOKENS) -> str:
+    def _truncate_tokens(self, text: str, max_tokens: int | None = None) -> str:
+        max_tokens = self.max_content_tokens if max_tokens is None else max_tokens
         tokens = self._encoding.encode(text)
         if len(tokens) <= max_tokens:
             return text
         return self._encoding.decode(tokens[:max_tokens])
+
+    def _count_tokens(self, text: str) -> int:
+        return len(self._encoding.encode(text))
+
+    @staticmethod
+    def _parse_context_length_error(
+        exc: Exception,
+    ) -> _ContextLengthExceededError | None:
+        message = str(exc)
+        match = _CONTEXT_LENGTH_RE.search(message)
+        if match is None:
+            return None
+
+        max_context_tokens = int(match.group(1))
+        input_tokens = int(match.group(2))
+        output_match = _OUTPUT_TOKEN_RE.search(message)
+        requested_output_tokens = (
+            int(output_match.group(1))
+            if output_match is not None
+            else _SUMMARIZER_MAX_OUTPUT_TOKENS
+        )
+        return _ContextLengthExceededError(
+            max_context_tokens=max_context_tokens,
+            input_tokens=input_tokens,
+            requested_output_tokens=requested_output_tokens,
+            original_error=exc,
+        )
+
+    def _next_retry_content_limit(
+        self,
+        content: str,
+        current_limit: int,
+        context_error: _ContextLengthExceededError,
+    ) -> int:
+        local_content_tokens = max(1, self._count_tokens(content))
+        allowed_input_tokens = max(
+            1,
+            context_error.max_context_tokens
+            - context_error.requested_output_tokens
+            - _CONTEXT_TOKEN_SAFETY_MARGIN,
+        )
+        shrink_ratio = (
+            allowed_input_tokens
+            / max(1, context_error.input_tokens)
+            * _CONTENT_REDUCTION_SAFETY_RATIO
+        )
+        shrink_ratio = min(0.95, shrink_ratio)
+        proposed_limit = int(local_content_tokens * shrink_ratio)
+        proposed_limit = min(current_limit - _MIN_RETRY_STEP_TOKENS, proposed_limit)
+        return max(_MIN_RETRY_CONTENT_TOKENS, proposed_limit)
 
     def _fetch_jina(self, url: str) -> str:
         print(f"[Jina Reader] Reading: {url}")
@@ -153,13 +232,16 @@ class VisitTool(BaseTool):
                 resp = self._llm.chat.completions.create(
                     model=self._llm_model,
                     messages=messages,
-                    max_tokens=8192,
+                    max_tokens=_SUMMARIZER_MAX_OUTPUT_TOKENS,
                 )
                 content = resp.choices[0].message.content or ""
                 content = content.split("</think>")[-1]
                 if content:
                     return content
             except Exception as exc:
+                context_error = self._parse_context_length_error(exc)
+                if context_error is not None:
+                    raise context_error
                 print(
                     f"Summarize Error: {type(exc).__name__}: {exc} "
                     f"content: {content!r} attempt: {attempt}"
@@ -199,16 +281,43 @@ class VisitTool(BaseTool):
         ):
             return _fail_response(url, goal)
 
-        content = self._truncate_tokens(content)
-        print(f"call summarize {url}")
-        messages = [
-            {
-                "role": "user",
-                "content": EXTRACTOR_PROMPT.format(webpage_content=content, goal=goal),
-            }
-        ]
+        raw = ""
+        content_limit = self.max_content_tokens
+        while True:
+            content = self._truncate_tokens(content, content_limit)
+            print(
+                f"call summarize {url} "
+                f"(visit_content_tokens={self._count_tokens(content)}, "
+                f"limit={content_limit})"
+            )
+            messages = [
+                {
+                    "role": "user",
+                    "content": EXTRACTOR_PROMPT.format(
+                        webpage_content=content,
+                        goal=goal,
+                    ),
+                }
+            ]
 
-        raw = self._call_llm(messages)
+            try:
+                raw = self._call_llm(messages)
+                break
+            except _ContextLengthExceededError as exc:
+                next_limit = self._next_retry_content_limit(
+                    content=content,
+                    current_limit=content_limit,
+                    context_error=exc,
+                )
+                if next_limit >= content_limit:
+                    return _fail_response(url, goal)
+                print(
+                    "[VisitTool] Context length exceeded while summarizing "
+                    f"{url}; reducing visit content limit from {content_limit} "
+                    f"to {next_limit} tokens and retrying."
+                )
+                content_limit = next_limit
+
         parsed = self._extract_json(raw)
 
         if isinstance(parsed, dict):

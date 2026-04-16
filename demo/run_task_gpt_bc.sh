@@ -5,15 +5,15 @@ cd /share/project/yuyang/Gizmo/demo
 
 # Edit these values directly before running.
 REASONING_MODEL="gpt-5.4-mini"
-REASONING_MODEL_BASE_URL=""
-REASONING_MODEL_API_KEY=""
+REASONING_MODEL_BASE_URL="https://aigc.x-see.cn/v1"
+REASONING_MODEL_API_KEY="sk-9LM8rl6XYrbThqUm6Z3RSQm8Q1fsuWTi1stBJuf6dPogKA33"
 
 AUXILIARY_MODEL="gpt-5.4-mini"
-AUXILIARY_MODEL_BASE_URL=""
-AUXILIARY_MODEL_API_KEY=""
+AUXILIARY_MODEL_BASE_URL="https://aigc.x-see.cn/v1"
+AUXILIARY_MODEL_API_KEY="sk-9LM8rl6XYrbThqUm6Z3RSQm8Q1fsuWTi1stBJuf6dPogKA33"
 
-SEARCH_API_KEY=""
-JINA_API_KEY=""
+SEARCH_API_KEY="gTUwkeLUxo79mkT8CWp2esY8g2gVFeB6"
+JINA_API_KEY="gTUwkeLUxo79mkT8CWp2esY8g2gVFeB6"
 
 python3 run_task_gpt_bc.py \
   --eval_task bc \
