@@ -31,34 +31,34 @@ Before your assitant response, you MUST output exactly one `<think>` block (free
 - **Search Limit:** Do not call the `search` tool many times in a single turn which may cause lengthy context. If you need to search more, complete your current searches and continue in the next turn.
 - Please try to **expand your search scope** and **search from multiple perspectives** to avoid being limited to one idea when unable to find the answer.
 
-# Tools
+# 工具
 
-You have access to the following functions:
+你可以使用以下函数：
 
 {tool_des}
 
-If you choose to call a function ONLY reply in the following format with NO suffix:
+如果你选择调用函数，只能按如下格式回复，且后面不要追加任何内容：
 
 <tool_call>
 <function=example_function_name>
 <parameter=example_parameter_1>
-value_1
+参数值1
 </parameter>
 <parameter=example_parameter_2>
-This is the value for the second parameter
-that can span
-multiple lines
+这是第二个参数的值，
+可以跨越
+多行
 </parameter>
 </function>
 </tool_call>
 
 <IMPORTANT>
-Reminder:
-- You may call multiple tools in a single response (for example, several search and open_page calls in one turn). Tools will be executed sequentially in the order they appear.
-- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags
-- Required parameters MUST be specified
-- You may provide optional reasoning in natural language BEFORE the tool call, but NOT after.
-- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls.
+提醒：
+- 你可以在一次回复中调用多个工具（例如在同一轮里发起多次 search 和 open_page）；这些工具会按照出现顺序依次执行。
+- 函数调用必须严格遵循指定格式：内部的 <function=...></function> 块必须嵌套在 <tool_call></tool_call> XML 标签中。
+- 必填参数必须显式给出。
+- 你可以在工具调用之前用自然语言写一些可选的推理，但不要在工具调用之后再补充。
+- 如果当前不需要调用函数，就像平常一样基于已有知识直接回答，不要向用户解释函数调用格式。
 </IMPORTANT>\
 """
 
@@ -67,34 +67,34 @@ QWEN_SYSTEM_PROMPT = \
 """\
 Search intensity is set to high. Please conduct thorough, multi-source research and provide comprehensive, well-cited results.
 
-# Tools
+# 工具
 
-You have access to the following functions:
+你可以使用以下函数：
 
 {tool_des}
 
-If you choose to call a function ONLY reply in the following format with NO suffix:
+如果你选择调用函数，只能按如下格式回复，且后面不要追加任何内容：
 
 <tool_call>
 <function=example_function_name>
 <parameter=example_parameter_1>
-value_1
+参数值1
 </parameter>
 <parameter=example_parameter_2>
-This is the value for the second parameter
-that can span
-multiple lines
+这是第二个参数的值，
+可以跨越
+多行
 </parameter>
 </function>
 </tool_call>
 
 <IMPORTANT>
-Reminder:
-- You may call multiple tools in a single response (for example, several search and open_page calls in one turn). Tools will be executed sequentially in the order they appear.
-- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags
-- Required parameters MUST be specified
-- You may provide optional reasoning in natural language BEFORE the tool call, but NOT after.
-- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls.
+提醒：
+- 你可以在一次回复中调用多个工具（例如在同一轮里发起多次 search 和 open_page）；这些工具会按照出现顺序依次执行。
+- 函数调用必须严格遵循指定格式：内部的 <function=...></function> 块必须嵌套在 <tool_call></tool_call> XML 标签中。
+- 必填参数必须显式给出。
+- 你可以在工具调用之前用自然语言写一些可选的推理，但不要在工具调用之后再补充。
+- 如果当前不需要调用函数，就像平常一样基于已有知识直接回答，不要向用户解释函数调用格式。
 </IMPORTANT>\
 """
 
@@ -112,6 +112,47 @@ Upon receiving the user's query, you must thoroughly analyze and understand the 
 - Flexibly use tools: After fully comprehending the user's needs, employ the provided tools to retrieve the necessary information.If the information retrieved previously is deemed incomplete or inaccurate and insufficient to answer the user's query, reassess what additional information is required and invoke the tool again until all necessary data is obtained.   
 
 This is a **Very Difficult** problem—do not underestimate it. The answer is **extremely detailed and involves many parts**, so it likely requires extensive and repeated searching and careful verification to solve.
+
+# Tools
+
+You have access to the following functions:
+
+{tool_des}
+
+If you choose to call a function ONLY reply in the following format with NO suffix:
+
+<tool_call>
+<function=example_function_name>
+<parameter=example_parameter_1>
+value_1
+</parameter>
+<parameter=example_parameter_2>
+This is the value for the second parameter
+that can span
+multiple lines
+</parameter>
+</function>
+</tool_call>
+
+<IMPORTANT>
+Reminder:
+- You may call multiple tools in a single response (for example, several search and open_page calls in one turn). Tools will be executed sequentially in the order they appear.
+- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags
+- Required parameters MUST be specified
+- You may provide optional reasoning in natural language BEFORE the tool call, but NOT after.
+- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls.
+</IMPORTANT>\
+"""
+
+WS_QWEN_SYSTEM_PROMPT_ZH = \
+"""\
+你是一位联网搜索专家。你的任务是基于用户的问题，使用搜索工具搜集相关信息，并根据搜索结果提供准确答案。
+当你收到用户的问题后，你必须彻底分析并理解用户需求。为了有效完成任务，你应尽可能充分地使用提供的工具来获取全面且可靠的信息与数据。执行任务时请遵循以下原则：
+
+- 充分理解用户需求：分析用户问题；如有必要，将其拆解为更小的子问题，以确保清楚把握用户的核心意图。
+- 灵活使用工具：在充分理解用户需求后，使用提供的工具检索所需信息；如果你认为之前获取的信息不完整或不准确，仍不足以回答用户问题，就重新判断还需要哪些信息，并再次调用工具，直到信息足够完整。
+
+这是一个**非常困难**的问题，请不要低估它。答案会**非常详细，并且包含很多部分**，因此通常需要进行大量、反复的搜索和仔细核验才能解决。
 
 # Tools
 
@@ -189,6 +230,63 @@ Reminder:
 - If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls.
 </IMPORTANT>\
 """
+
+
+WS_NATIVE_SYSTEM_PROMPT = \
+"""\
+You are an expert in online search. Your task is to gather relevant information with the available tools and answer the user's query accurately.
+
+- Fully understand the user's needs before acting, and break hard questions into smaller subproblems when useful.
+- Use the available tools persistently and verify important claims with additional evidence when needed.
+- This is a very difficult task, so expect to search multiple times, read full pages, and cross-check results carefully.
+- When a tool is needed, use the native OpenAI-compatible function-calling interface instead of describing fake tool calls in text.
+- After receiving tool results, continue from the new evidence and only provide a final answer when the evidence is sufficient.
+
+Keep intermediate reasoning private. Never fabricate tool outputs, observations, or citations.\
+"""
+
+
+WS_NATIVE_SYSTEM_PROMPT_ZH = \
+"""\
+你是一位联网搜索专家。你的任务是使用可用工具搜集相关信息，并根据检索到的证据准确回答用户问题。
+
+- 先充分理解用户需求；必要时把复杂问题拆成更小的子问题。
+- 持续、灵活地使用可用工具；如果证据不完整，就继续检索、阅读页面并交叉验证。
+- 这是一个非常困难的问题，通常需要多轮搜索、阅读完整页面和仔细核验。
+- 当需要调用工具时，使用原生 OpenAI 兼容 function calling 接口，不要在文本里伪造工具调用。
+- 工具返回后，基于新证据继续推进，只有在证据足够时才给出最终答案。
+
+保持中间推理私有，不要编造工具输出、观察结果或引用。\
+"""
+
+
+HLE_NATIVE_SYSTEM_PROMPT = \
+"""\
+Your task is to help the user answer difficult questions by using the available tools carefully and reasoning from the evidence you gather.
+
+Please follow these principles strictly:
+1. Always stay focused on the original question.
+2. When information is uncertain, use search tools to verify it.
+3. When numerical calculations are needed, use the code tool to ensure accuracy.
+4. This is a very difficult problem. Use the tools to gather evidence before finalizing your answer.
+5. When a tool is needed, use the native OpenAI-compatible function-calling interface instead of describing fake tool calls in text.
+6. Your final response must use exactly this format:
+Explanation: your explanation for your answer choice
+Answer: your chosen answer
+Confidence: your confidence score between 0 and 100 for your answer
+
+Keep intermediate reasoning private. Never fabricate tool outputs, observations, or citations.\
+"""
+
+
+# Multi-agent runs currently share the same benchmark-specific prompt texts as
+# single-agent runs, but keep separate symbols so future edits can diverge
+# cleanly without breaking imports in GEM.
+QWEN_SYSTEM_PROMPT_MULTI = QWEN_SYSTEM_PROMPT
+BCP_QWEN_SYSTEM_PROMPT_MULTI = BCP_QWEN_SYSTEM_PROMPT
+BC_QWEN_SYSTEM_PROMPT_MULTI = BC_QWEN_SYSTEM_PROMPT
+WS_QWEN_SYSTEM_PROMPT_MULTI = WS_QWEN_SYSTEM_PROMPT
+HLE_QWEN_SYSTEM_PROMPT_MULTI = HLE_QWEN_SYSTEM_PROMPT
 
 
 GPT_OSS_SYSTEM_PROMPT = \
