@@ -7,7 +7,7 @@ Tools:
   - SearchTool + VisitTool for BC-style online-tool runs
 
 Function signature and return-dict shape stay close to
-GEM/inference/single_agent_qwen.py.
+the unified GEM single-agent inference entrypoints.
 """
 
 import json

@@ -64,11 +64,11 @@ def make_response(message):
 class GLMAgentCompatibilityTests(unittest.TestCase):
     def make_agent(self, *, llm_config: LLMConfig | None = None, max_steps: int = 3) -> GLMAgent:
         return GLMAgent(
-            model="glm-4.5",
+            model="glm-4.7",
             api_key="fake-key",
-            base_url="https://open.bigmodel.cn/api/paas/v4/",
+            base_url="http://transit.local/v1",
             tools=[DummyTool("search")],
-            llm_config=llm_config or LLMConfig(),
+            llm_config=llm_config or LLMConfig(stream=False),
             max_steps=max_steps,
         )
 
@@ -80,6 +80,7 @@ class GLMAgentCompatibilityTests(unittest.TestCase):
                 top_p=0.8,
                 tool_choice="auto",
                 enable_thinking=True,
+                stream=False,
             )
         )
         agent.client = FakeClient([make_response(SimpleNamespace(content="done"))])
@@ -88,7 +89,7 @@ class GLMAgentCompatibilityTests(unittest.TestCase):
         agent._call_llm()
 
         payload = agent.client.chat.completions.calls[0]
-        self.assertEqual(payload["model"], "glm-4.5")
+        self.assertEqual(payload["model"], "glm-4.7")
         self.assertEqual(
             payload["messages"],
             [

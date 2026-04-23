@@ -62,13 +62,19 @@ def make_response(message):
 
 
 class KimiAgentCompatibilityTests(unittest.TestCase):
-    def make_agent(self, *, llm_config: LLMConfig | None = None, max_steps: int = 3) -> KimiAgent:
+    def make_agent(
+        self,
+        *,
+        model: str = "kimi2",
+        llm_config: LLMConfig | None = None,
+        max_steps: int = 3,
+    ) -> KimiAgent:
         return KimiAgent(
-            model="kimi-k2.5",
+            model=model,
             api_key="fake-key",
-            base_url="https://api.moonshot.cn/v1",
+            base_url="http://transit.local/v1",
             tools=[DummyTool("search")],
-            llm_config=llm_config or LLMConfig(),
+            llm_config=llm_config or LLMConfig(stream=False),
             max_steps=max_steps,
         )
 
@@ -80,6 +86,7 @@ class KimiAgentCompatibilityTests(unittest.TestCase):
                 top_p=0.9,
                 tool_choice="auto",
                 enable_thinking=True,
+                stream=False,
             )
         )
         agent.client = FakeClient([make_response(SimpleNamespace(content="done"))])
@@ -88,7 +95,7 @@ class KimiAgentCompatibilityTests(unittest.TestCase):
         agent._call_llm()
 
         payload = agent.client.chat.completions.calls[0]
-        self.assertEqual(payload["model"], "kimi-k2.5")
+        self.assertEqual(payload["model"], "kimi2")
         self.assertEqual(
             payload["messages"],
             [
@@ -100,7 +107,7 @@ class KimiAgentCompatibilityTests(unittest.TestCase):
         self.assertEqual(payload["temperature"], 1.0)
         self.assertEqual(payload["top_p"], 0.9)
         self.assertEqual(payload["tool_choice"], "auto")
-        self.assertEqual(payload["extra_body"], {"thinking": {"type": "enabled"}})
+        self.assertNotIn("extra_body", payload)
         self.assertEqual(
             payload["tools"],
             [
@@ -118,6 +125,29 @@ class KimiAgentCompatibilityTests(unittest.TestCase):
                 }
             ],
         )
+
+    def test_kimi_k25_compatibility_adds_thinking_body(self):
+        agent = self.make_agent(
+            model="kimi-k2.5",
+            llm_config=LLMConfig(
+                max_tokens=256,
+                temperature=1.0,
+                top_p=0.9,
+                tool_choice="auto",
+                enable_thinking=True,
+                stream=False,
+            ),
+        )
+        agent.client = FakeClient([make_response(SimpleNamespace(content="done"))])
+        agent.messages = [{"role": "user", "content": "hello"}]
+
+        agent._call_llm()
+
+        payload = agent.client.chat.completions.calls[0]
+        self.assertEqual(payload["model"], "kimi-k2.5")
+        self.assertNotIn("temperature", payload)
+        self.assertNotIn("top_p", payload)
+        self.assertEqual(payload["extra_body"], {"thinking": {"type": "enabled"}})
 
     def test_parse_response_message_preserves_reasoning_and_tool_history_shape(self):
         agent = self.make_agent()

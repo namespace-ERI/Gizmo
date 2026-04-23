@@ -1,4 +1,5 @@
 import copy
+import os
 from typing import Optional
 
 from Gizmo.agents.base_agent import NativeToolChatAgent
@@ -18,7 +19,12 @@ class GLMAgent(NativeToolChatAgent):
         super().__init__(
             *args,
             system_prompt=system_prompt,
-            base_url=base_url or "https://open.bigmodel.cn/api/paas/v4/",
+            base_url=(
+                base_url
+                or os.environ.get("GLM_BASE_URL")
+                or os.environ.get("TRANSIT_BASE_URL")
+                or "http://localhost:8001/v1"
+            ),
             **kwargs,
         )
 

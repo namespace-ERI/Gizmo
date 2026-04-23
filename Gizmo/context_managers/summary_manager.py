@@ -1,3 +1,4 @@
+import json
 from typing import Optional
 
 from openai import OpenAI
@@ -40,10 +41,51 @@ def _stringify_content(content) -> str:
     return str(content)
 
 
-def _count_tokens(messages: list[dict], encoder) -> int:
+def _stringify_tool_calls(tool_calls) -> str:
+    if not tool_calls:
+        return ""
+    if isinstance(tool_calls, str):
+        return tool_calls
+    try:
+        return json.dumps(tool_calls, ensure_ascii=False)
+    except TypeError:
+        return str(tool_calls)
+
+
+def _stringify_message(message: dict, *, include_structured_fields: bool) -> str:
+    content = _stringify_content(message.get("content")).strip()
+    if not include_structured_fields:
+        return content
+
+    parts: list[str] = []
+    reasoning = _stringify_content(
+        message.get("reasoning_content")
+        or message.get("reasoning")
+        or message.get("thinking")
+    ).strip()
+    tool_calls = _stringify_tool_calls(message.get("tool_calls")).strip()
+
+    if reasoning:
+        parts.append(reasoning)
+    if content:
+        parts.append(content)
+    if tool_calls:
+        parts.append(tool_calls)
+    return "\n\n".join(parts).strip()
+
+
+def _count_tokens(
+    messages: list[dict],
+    encoder,
+    *,
+    include_structured_fields: bool = False,
+) -> int:
     total = 0
     for msg in messages:
-        text = _stringify_content(msg.get("content"))
+        text = _stringify_message(
+            msg,
+            include_structured_fields=include_structured_fields,
+        )
         if encoder is None:
             total += _estimate_tokens_without_tiktoken(text)
         else:
@@ -67,6 +109,7 @@ class RollingSummaryContextManager(ContextManager):
         summary_temperature: float = 0.0,
         request_timeout: float = 120.0,
         encoder_name: str = "cl100k_base",
+        include_structured_fields: bool = False,
     ):
         self._model = summary_model or model
         self._max_input_tokens = int(max_input_tokens)
@@ -79,6 +122,7 @@ class RollingSummaryContextManager(ContextManager):
             timeout=float(request_timeout),
         )
         self._enc = tiktoken.get_encoding(encoder_name) if tiktoken is not None else None
+        self._include_structured_fields = bool(include_structured_fields)
         self._original_user_content: Optional[str] = None
         self._rolling_summary = ""
 
@@ -98,7 +142,11 @@ class RollingSummaryContextManager(ContextManager):
         self._remember_original_user_message(managed[user_idx])
         self._rewrite_first_user_message(managed, user_idx, self._rolling_summary)
 
-        total_tokens = _count_tokens(managed, self._enc)
+        total_tokens = _count_tokens(
+            managed,
+            self._enc,
+            include_structured_fields=self._include_structured_fields,
+        )
         if total_tokens <= self._max_input_tokens:
             return managed
 
@@ -112,7 +160,11 @@ class RollingSummaryContextManager(ContextManager):
 
         compacted = managed[: user_idx + 1]
         compacted = self._fit_summary_to_budget(compacted, user_idx, summary.strip())
-        compacted_tokens = _count_tokens(compacted, self._enc)
+        compacted_tokens = _count_tokens(
+            compacted,
+            self._enc,
+            include_structured_fields=self._include_structured_fields,
+        )
 
         print(
             "[ContextSummary] Collapsed history "
@@ -156,7 +208,10 @@ class RollingSummaryContextManager(ContextManager):
         messages[user_idx]["content"] = self._compose_first_user_content(summary)
 
     def _summarize_messages(self, messages: list[dict]) -> str:
-        rendered = self._render_messages(messages)
+        rendered = self._render_messages(
+            messages,
+            include_structured_fields=self._include_structured_fields,
+        )
         if not rendered:
             return ""
 
@@ -172,11 +227,22 @@ class RollingSummaryContextManager(ContextManager):
         return _stringify_content(response.choices[0].message.content).strip()
 
     @staticmethod
-    def _render_messages(messages: list[dict]) -> str:
+    def _render_messages(
+        messages: list[dict],
+        *,
+        include_structured_fields: bool = False,
+    ) -> str:
         parts = []
         for msg in messages:
             role = msg.get("role") or "unknown"
             content = _stringify_content(msg.get("content")).strip()
+            if include_structured_fields:
+                rendered = _stringify_message(
+                    msg,
+                    include_structured_fields=True,
+                )
+                if rendered:
+                    content = rendered
             if not content:
                 continue
             parts.append(f"[{role}]\n{content}")
@@ -190,7 +256,11 @@ class RollingSummaryContextManager(ContextManager):
     ) -> list[dict]:
         fitted = self._clone_messages(messages)
         self._rewrite_first_user_message(fitted, user_idx, summary)
-        if _count_tokens(fitted, self._enc) <= self._max_input_tokens:
+        if _count_tokens(
+            fitted,
+            self._enc,
+            include_structured_fields=self._include_structured_fields,
+        ) <= self._max_input_tokens:
             self._rolling_summary = summary
             return fitted
 
@@ -208,7 +278,11 @@ class RollingSummaryContextManager(ContextManager):
             candidate_summary = candidate_from_mid(mid)
             candidate_messages = self._clone_messages(messages)
             self._rewrite_first_user_message(candidate_messages, user_idx, candidate_summary)
-            if _count_tokens(candidate_messages, self._enc) <= self._max_input_tokens:
+            if _count_tokens(
+                candidate_messages,
+                self._enc,
+                include_structured_fields=self._include_structured_fields,
+            ) <= self._max_input_tokens:
                 best = candidate_summary
                 low = mid + 1
             else:
@@ -217,7 +291,11 @@ class RollingSummaryContextManager(ContextManager):
         self._rolling_summary = best
         self._rewrite_first_user_message(fitted, user_idx, best)
 
-        if _count_tokens(fitted, self._enc) > self._max_input_tokens:
+        if _count_tokens(
+            fitted,
+            self._enc,
+            include_structured_fields=self._include_structured_fields,
+        ) > self._max_input_tokens:
             print(
                 "[ContextSummary] Warning: compacted prompt still exceeds the token budget "
                 "after trimming the summary."

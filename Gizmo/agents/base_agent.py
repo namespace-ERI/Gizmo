@@ -25,6 +25,8 @@ class LLMConfig:
         top_p:            nucleus sampling 参数。
         seed:             随机种子，用于复现。
         timeout:          HTTP 请求超时（秒），同时作为 OpenAI 客户端超时。
+        stream:           是否使用 chat.completions 流式返回；None 表示由具体
+                          Agent 决定默认行为。
         enable_thinking:  是否开启 vllm thinking 模式（通过 extra_body 注入
                           chat_template_kwargs.enable_thinking=True）。
         extra_body:       透传给 OpenAI API 的额外请求体字段（如 vllm 扩展参数），
@@ -51,6 +53,7 @@ class LLMConfig:
     top_p: Optional[float] = None
     seed: Optional[int] = None
     timeout: float = 120.0
+    stream: Optional[bool] = None
     enable_thinking: bool = False
     extra_body: Optional[dict] = None
     store: Optional[bool] = None
@@ -273,6 +276,18 @@ class BaseAgent:
             tmpl["enable_thinking"] = True
 
         return base or None
+
+    def _default_stream(self) -> bool:
+        return False
+
+    def _should_stream_response(self) -> bool:
+        if self.llm_config.stream is not None:
+            return bool(self.llm_config.stream)
+        return self._default_stream()
+
+    def _prepare_request_kwargs(self, kwargs: dict) -> dict:
+        """子类可在发送请求前调整 OpenAI-compatible 请求参数。"""
+        return kwargs
 
     def _prepare_messages_for_llm(self, messages: list[dict]) -> list[dict]:
         """子类可在真正发起请求前校验或规范化消息列表。"""
@@ -521,6 +536,11 @@ class NativeToolChatAgent(BaseAgent):
     def _use_native_tools(self) -> bool:
         return True
 
+    def _default_stream(self) -> bool:
+        # GLM/Kimi thinking responses can be very large. Streaming avoids provider
+        # and proxy timeouts while preserving the same parsed message shape.
+        return True
+
     @staticmethod
     def _get_field(obj: Any, name: str, default=None):
         if obj is None:
@@ -573,6 +593,96 @@ class NativeToolChatAgent(BaseAgent):
             return arguments
         return json.dumps(arguments or {}, ensure_ascii=False)
 
+    def _collect_stream_response(self, stream: Any) -> dict:
+        content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        tool_calls_by_index: dict[int, dict[str, Any]] = {}
+        role = "assistant"
+
+        for chunk in stream:
+            choices = self._get_field(chunk, "choices", []) or []
+            for choice in choices:
+                delta = self._get_field(choice, "delta", {}) or {}
+                delta_role = self._get_field(delta, "role")
+                if delta_role:
+                    role = delta_role
+
+                reasoning_piece = (
+                    self._get_field(delta, "reasoning_content")
+                    or self._get_field(delta, "reasoning")
+                    or self._get_field(delta, "thinking")
+                )
+                if reasoning_piece:
+                    reasoning_parts.append(str(reasoning_piece))
+
+                content_piece = self._get_field(delta, "content")
+                if content_piece:
+                    content_parts.append(str(content_piece))
+
+                raw_tool_calls = self._get_field(delta, "tool_calls") or []
+                for fallback_index, tool_call in enumerate(raw_tool_calls):
+                    index = self._get_field(tool_call, "index", fallback_index)
+                    try:
+                        index = int(index)
+                    except Exception:
+                        index = fallback_index
+
+                    state = tool_calls_by_index.setdefault(
+                        index,
+                        {
+                            "id": "",
+                            "type": "function",
+                            "function": {
+                                "name": "",
+                                "arguments": "",
+                            },
+                        },
+                    )
+
+                    tool_call_id = self._get_field(tool_call, "id")
+                    if tool_call_id:
+                        state["id"] = tool_call_id
+                    tool_call_type = self._get_field(tool_call, "type")
+                    if tool_call_type:
+                        state["type"] = tool_call_type
+
+                    function = self._get_field(tool_call, "function", {}) or {}
+                    tool_name = (
+                        self._get_field(function, "name")
+                        or self._get_field(tool_call, "name")
+                    )
+                    if tool_name:
+                        state["function"]["name"] += str(tool_name)
+                    arguments = self._get_field(function, "arguments")
+                    if arguments:
+                        state["function"]["arguments"] += str(arguments)
+
+        message: dict[str, Any] = {
+            "role": role,
+            "content": "".join(content_parts),
+        }
+        if reasoning_parts:
+            message["reasoning_content"] = "".join(reasoning_parts)
+
+        tool_calls = []
+        for _, tool_call in sorted(tool_calls_by_index.items()):
+            if not tool_call["function"].get("name"):
+                continue
+            cleaned = {
+                "type": tool_call.get("type") or "function",
+                "function": {
+                    "name": tool_call["function"].get("name", ""),
+                    "arguments": tool_call["function"].get("arguments", ""),
+                },
+            }
+            if tool_call.get("id"):
+                cleaned["id"] = tool_call["id"]
+            tool_calls.append(cleaned)
+        if tool_calls:
+            message["tool_calls"] = tool_calls
+
+        return {"choices": [{"message": message}]}
+
     def _call_llm(self):
         raw_messages = [{"role": "system", "content": self.system_prompt}] + self.messages
         messages = self._apply_context_managers(raw_messages)
@@ -604,7 +714,14 @@ class NativeToolChatAgent(BaseAgent):
         if tools:
             kwargs["tools"] = tools
 
-        return self.client.chat.completions.create(**kwargs)
+        if self._should_stream_response():
+            kwargs["stream"] = True
+
+        kwargs = self._prepare_request_kwargs(kwargs)
+        response = self.client.chat.completions.create(**kwargs)
+        if kwargs.get("stream"):
+            return self._collect_stream_response(response)
+        return response
 
     def _parse_native_tool_calls(self, raw_tool_calls: Any) -> tuple[list[dict], list[dict]]:
         if not raw_tool_calls:
@@ -687,7 +804,12 @@ class NativeToolChatAgent(BaseAgent):
         }
 
     def _parse_llm_response(self, response) -> dict:
-        return self._parse_response_message(response.choices[0].message)
+        choices = self._get_field(response, "choices", []) or []
+        if not choices:
+            return self._parse_response_message({})
+        first_choice = choices[0]
+        message = self._get_field(first_choice, "message", {})
+        return self._parse_response_message(message)
 
     def _parse_response(self, raw_content: str) -> dict:
         raw_content = self._normalize_content(raw_content)

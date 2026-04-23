@@ -43,6 +43,8 @@ _VISIT_DESCRIPTION = "Visit webpage(s) and return the summary of the content."
 
 _MAX_CONTENT_TOKENS = 95_000
 _JINA_VISIT_URL = "http://api.rag.ac.cn/visit_pages_v1"
+_JINA_CONNECT_TIMEOUT_SECONDS = 10.0
+_JINA_READ_TIMEOUT_SECONDS = 180.0
 _MAX_VISIT_RETRIES = 10
 _SUMMARIZER_MAX_OUTPUT_TOKENS = 8192
 _CONTEXT_TOKEN_SAFETY_MARGIN = 2048
@@ -99,6 +101,7 @@ class VisitTool(BaseTool):
         llm_model: str,
         llm_max_retries: int = 3,
         max_content_tokens: int = _MAX_CONTENT_TOKENS,
+        jina_timeout: float = _JINA_READ_TIMEOUT_SECONDS,
     ):
         super().__init__(
             name="visit",
@@ -111,6 +114,7 @@ class VisitTool(BaseTool):
         self._llm_model = llm_model
         self._encoding = tiktoken.get_encoding("cl100k_base")
         self.max_content_tokens = max(1, int(max_content_tokens))
+        self.jina_timeout = max(1.0, float(jina_timeout))
 
     @staticmethod
     def _retry_delay(attempt: int) -> float:
@@ -185,7 +189,7 @@ class VisitTool(BaseTool):
                     _JINA_VISIT_URL,
                     json=payload,
                     headers=headers,
-                    timeout=(10, 60),
+                    timeout=(_JINA_CONNECT_TIMEOUT_SECONDS, self.jina_timeout),
                 )
 
                 if resp.status_code == 429 or resp.status_code >= 500:

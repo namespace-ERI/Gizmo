@@ -51,7 +51,7 @@ UNSAFE_PATTERNS = [
 ]
 
 _CODE_INTERPRETER_DESCRIPTION = "Python code sandbox, which can be used to execute Python code."
-_DEFAULT_TIMEOUT_SECONDS = 30
+_DEFAULT_TIMEOUT_SECONDS = 60
 _ACTIVE_SESSIONS: "weakref.WeakSet[_PersistentInterpreterSession]" = weakref.WeakSet()
 
 
