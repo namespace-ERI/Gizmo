@@ -28,14 +28,28 @@ class GLMAgent(NativeToolChatAgent):
             **kwargs,
         )
 
+    def _default_stream(self) -> bool:
+        # The transit GLM endpoint currently exposes OpenAI-compatible chat
+        # completions but may not support SSE streaming reliably.
+        return False
+
+    def _uses_openrouter_reasoning(self) -> bool:
+        base_url = str(getattr(self, "base_url", "") or "").lower()
+        model_name = str(self.model or "").strip().lower()
+        return "openrouter.ai" in base_url or model_name.startswith("z-ai/")
+
     def _build_extra_body(self) -> Optional[dict]:
         cfg = self.llm_config
         base = copy.deepcopy(cfg.extra_body) if cfg.extra_body else {}
 
         if cfg.enable_thinking:
-            thinking = base.setdefault("thinking", {})
-            thinking.setdefault("type", "enabled")
-            thinking.setdefault("clear_thinking", False)
+            if self._uses_openrouter_reasoning():
+                reasoning = base.setdefault("reasoning", {})
+                reasoning.setdefault("enabled", True)
+            else:
+                thinking = base.setdefault("thinking", {})
+                thinking.setdefault("type", "enabled")
+                thinking.setdefault("clear_thinking", False)
 
         return base or None
 

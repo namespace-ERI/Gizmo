@@ -168,6 +168,7 @@ class BaseAgent:
         llm_config: Optional[LLMConfig] = None,
     ):
         self.model = model
+        self.base_url = base_url
         self.system_prompt = system_prompt
         self.tools = {tool.name: tool for tool in (tools or [])}
         self.max_steps = max_steps
@@ -593,9 +594,24 @@ class NativeToolChatAgent(BaseAgent):
             return arguments
         return json.dumps(arguments or {}, ensure_ascii=False)
 
+    @classmethod
+    def _to_plain_data(cls, value: Any) -> Any:
+        if value is None:
+            return None
+        if hasattr(value, "model_dump"):
+            return cls._to_plain_data(value.model_dump())
+        if isinstance(value, dict):
+            return {key: cls._to_plain_data(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [cls._to_plain_data(item) for item in value]
+        if isinstance(value, tuple):
+            return [cls._to_plain_data(item) for item in value]
+        return copy.deepcopy(value)
+
     def _collect_stream_response(self, stream: Any) -> dict:
         content_parts: list[str] = []
         reasoning_parts: list[str] = []
+        reasoning_details_parts: list[Any] = []
         tool_calls_by_index: dict[int, dict[str, Any]] = {}
         role = "assistant"
 
@@ -614,6 +630,14 @@ class NativeToolChatAgent(BaseAgent):
                 )
                 if reasoning_piece:
                     reasoning_parts.append(str(reasoning_piece))
+
+                reasoning_details_piece = self._get_field(delta, "reasoning_details")
+                if reasoning_details_piece:
+                    plain_reasoning_details = self._to_plain_data(reasoning_details_piece)
+                    if isinstance(plain_reasoning_details, list):
+                        reasoning_details_parts.extend(plain_reasoning_details)
+                    else:
+                        reasoning_details_parts.append(plain_reasoning_details)
 
                 content_piece = self._get_field(delta, "content")
                 if content_piece:
@@ -663,6 +687,8 @@ class NativeToolChatAgent(BaseAgent):
         }
         if reasoning_parts:
             message["reasoning_content"] = "".join(reasoning_parts)
+        if reasoning_details_parts:
+            message["reasoning_details"] = reasoning_details_parts
 
         tool_calls = []
         for _, tool_call in sorted(tool_calls_by_index.items()):
@@ -773,6 +799,9 @@ class NativeToolChatAgent(BaseAgent):
 
     def _parse_response_message(self, msg: Any) -> dict:
         raw_content = self._normalize_content(self._get_field(msg, "content"))
+        reasoning_details = self._to_plain_data(
+            self._get_field(msg, "reasoning_details")
+        )
         reasoning_content = self._normalize_content(
             self._get_field(msg, "reasoning_content")
             or self._get_field(msg, "reasoning")
@@ -788,7 +817,9 @@ class NativeToolChatAgent(BaseAgent):
         assistant_message: dict[str, Any] = {"role": "assistant"}
         if raw_content or tool_calls or not history_tool_calls:
             assistant_message["content"] = raw_content
-        if reasoning_content:
+        if reasoning_details is not None:
+            assistant_message["reasoning_details"] = reasoning_details
+        elif reasoning_content:
             assistant_message["reasoning_content"] = reasoning_content
         if history_tool_calls:
             assistant_message["tool_calls"] = history_tool_calls
@@ -800,6 +831,7 @@ class NativeToolChatAgent(BaseAgent):
             "assistant_messages": [assistant_message],
             "tool_calls": tool_calls,
             "reasoning_content": reasoning_content,
+            "reasoning_details": reasoning_details,
             "final_content": final_content,
         }
 

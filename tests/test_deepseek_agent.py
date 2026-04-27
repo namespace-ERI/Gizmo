@@ -18,7 +18,7 @@ sys.modules.setdefault("openai", openai_stub)
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from Gizmo.agents.base_agent import LLMConfig
-from Gizmo.agents.glm_agent import GLMAgent
+from Gizmo.agents.deepseek_agent import DeepSeekAgent
 from Gizmo.tools.base_tool import BaseTool
 
 
@@ -61,16 +61,16 @@ def make_response(message):
     return SimpleNamespace(choices=[SimpleNamespace(message=message)])
 
 
-class GLMAgentCompatibilityTests(unittest.TestCase):
+class DeepSeekAgentCompatibilityTests(unittest.TestCase):
     def make_agent(
         self,
         *,
-        model: str = "glm-4.7",
-        base_url: str = "http://transit.local/v1",
+        model: str = "deepseek-v4-pro",
+        base_url: str = "https://api.deepseek.com",
         llm_config: LLMConfig | None = None,
         max_steps: int = 3,
-    ) -> GLMAgent:
-        return GLMAgent(
+    ) -> DeepSeekAgent:
+        return DeepSeekAgent(
             model=model,
             api_key="fake-key",
             base_url=base_url,
@@ -79,12 +79,7 @@ class GLMAgentCompatibilityTests(unittest.TestCase):
             max_steps=max_steps,
         )
 
-    def test_default_stream_is_disabled_for_transit_glm(self):
-        agent = self.make_agent()
-
-        self.assertFalse(agent._should_stream_response())
-
-    def test_call_llm_uses_chat_tools_shape_and_glm_thinking_body(self):
+    def test_call_llm_uses_deepseek_thinking_mode(self):
         agent = self.make_agent(
             llm_config=LLMConfig(
                 max_tokens=256,
@@ -101,18 +96,32 @@ class GLMAgentCompatibilityTests(unittest.TestCase):
         agent._call_llm()
 
         payload = agent.client.chat.completions.calls[0]
-        self.assertEqual(payload["model"], "glm-4.7")
-        self.assertEqual(
-            payload["messages"],
-            [
-                {"role": "system", "content": agent.system_prompt},
-                {"role": "user", "content": "hello"},
-            ],
-        )
+        self.assertEqual(payload["model"], "deepseek-v4-pro")
         self.assertEqual(payload["max_tokens"], 256)
-        self.assertEqual(payload["temperature"], 0.2)
-        self.assertEqual(payload["top_p"], 0.8)
         self.assertEqual(payload["tool_choice"], "auto")
+        self.assertNotIn("temperature", payload)
+        self.assertNotIn("top_p", payload)
+        self.assertEqual(payload["extra_body"], {"thinking": {"type": "enabled"}})
+        self.assertEqual(payload["reasoning_effort"], "high")
+
+    def test_call_llm_passes_explicit_deepseek_reasoning_effort(self):
+        agent = self.make_agent(
+            llm_config=LLMConfig(
+                enable_thinking=True,
+                reasoning_effort="max",
+                stream=False,
+            )
+        )
+        agent.client = FakeClient([make_response(SimpleNamespace(content="done"))])
+        agent.messages = [{"role": "user", "content": "hello"}]
+
+        agent._call_llm()
+
+        payload = agent.client.chat.completions.calls[0]
+        self.assertEqual(
+            payload["extra_body"], {"thinking": {"type": "enabled"}}
+        )
+        self.assertEqual(payload["reasoning_effort"], "high")
         self.assertEqual(
             payload["tools"],
             [
@@ -130,106 +139,17 @@ class GLMAgentCompatibilityTests(unittest.TestCase):
                 }
             ],
         )
-        self.assertEqual(
-            payload["extra_body"],
-            {"thinking": {"type": "enabled", "clear_thinking": False}},
-        )
 
-    def test_openrouter_glm_uses_reasoning_enabled_body(self):
-        agent = self.make_agent(
-            model="z-ai/glm-4.7",
-            base_url="https://openrouter.ai/api/v1",
-            llm_config=LLMConfig(enable_thinking=True, stream=False),
-        )
+    def test_call_llm_disables_deepseek_thinking_when_configured_off(self):
+        agent = self.make_agent(llm_config=LLMConfig(enable_thinking=False, stream=False))
         agent.client = FakeClient([make_response(SimpleNamespace(content="done"))])
         agent.messages = [{"role": "user", "content": "hello"}]
 
         agent._call_llm()
 
         payload = agent.client.chat.completions.calls[0]
-        self.assertEqual(payload["model"], "z-ai/glm-4.7")
-        self.assertEqual(payload["extra_body"], {"reasoning": {"enabled": True}})
-
-    def test_parse_response_message_preserves_official_tool_history_shape(self):
-        agent = self.make_agent()
-        message = SimpleNamespace(
-            content="",
-            reasoning_content="Need to search first.",
-            tool_calls=[
-                SimpleNamespace(
-                    id="call_1",
-                    type="function",
-                    function=SimpleNamespace(
-                        name="search",
-                        arguments='{"query":"alpha"}',
-                    ),
-                )
-            ],
-        )
-
-        parsed = agent._parse_response_message(message)
-
-        self.assertEqual(parsed["reasoning_content"], "Need to search first.")
-        self.assertEqual(parsed["final_content"], "")
-        self.assertEqual(
-            parsed["assistant_message"],
-            {
-                "role": "assistant",
-                "content": "",
-                "reasoning_content": "Need to search first.",
-                "tool_calls": [
-                    {
-                        "id": "call_1",
-                        "type": "function",
-                        "function": {
-                            "name": "search",
-                            "arguments": '{"query":"alpha"}',
-                        },
-                    }
-                ],
-            },
-        )
-        self.assertEqual(
-            parsed["tool_calls"],
-            [
-                {
-                    "id": "call_1",
-                    "type": "function",
-                    "function": {
-                        "name": "search",
-                        "arguments": {"query": "alpha"},
-                    },
-                }
-            ],
-        )
-
-    def test_parse_response_message_preserves_openrouter_reasoning_details(self):
-        agent = self.make_agent()
-        reasoning_details = [
-            {
-                "type": "reasoning.text",
-                "text": "Need to search first.",
-                "signature": "opaque",
-            }
-        ]
-        message = SimpleNamespace(
-            content="Final answer.",
-            reasoning="Need to search first.",
-            reasoning_details=reasoning_details,
-        )
-
-        parsed = agent._parse_response_message(message)
-
-        self.assertEqual(parsed["reasoning_content"], "Need to search first.")
-        self.assertEqual(parsed["reasoning_details"], reasoning_details)
-        self.assertEqual(
-            parsed["assistant_message"],
-            {
-                "role": "assistant",
-                "content": "Final answer.",
-                "reasoning_details": reasoning_details,
-            },
-        )
+        self.assertEqual(payload["extra_body"], {"thinking": {"type": "disabled"}})
+        self.assertNotIn("reasoning_effort", payload)
 
     def test_run_loop_executes_tool_and_appends_tool_message_with_tool_call_id(self):
         agent = self.make_agent(max_steps=3)

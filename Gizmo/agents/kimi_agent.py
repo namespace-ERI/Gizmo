@@ -32,13 +32,27 @@ class KimiAgent(NativeToolChatAgent):
         model_name = str(self.model or "").strip().lower()
         return model_name == "kimi-k2.5"
 
+    def _uses_openrouter_reasoning(self) -> bool:
+        base_url = str(getattr(self, "base_url", "") or "").lower()
+        model_name = str(self.model or "").strip().lower()
+        return "openrouter.ai" in base_url or model_name.startswith("moonshotai/")
+
+    def _default_stream(self) -> bool:
+        if self._uses_openrouter_reasoning():
+            return False
+        return super()._default_stream()
+
     def _build_extra_body(self) -> Optional[dict]:
         cfg = self.llm_config
         base = copy.deepcopy(cfg.extra_body) if cfg.extra_body else {}
 
-        if cfg.enable_thinking and self._supports_thinking_parameter():
-            thinking = base.setdefault("thinking", {})
-            thinking.setdefault("type", "enabled")
+        if cfg.enable_thinking:
+            if self._uses_openrouter_reasoning():
+                reasoning = base.setdefault("reasoning", {})
+                reasoning.setdefault("enabled", True)
+            elif self._supports_thinking_parameter():
+                thinking = base.setdefault("thinking", {})
+                thinking.setdefault("type", "enabled")
 
         return base or None
 

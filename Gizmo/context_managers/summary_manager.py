@@ -61,6 +61,7 @@ def _stringify_message(message: dict, *, include_structured_fields: bool) -> str
     reasoning = _stringify_content(
         message.get("reasoning_content")
         or message.get("reasoning")
+        or message.get("reasoning_details")
         or message.get("thinking")
     ).strip()
     tool_calls = _stringify_tool_calls(message.get("tool_calls")).strip()

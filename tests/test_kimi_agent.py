@@ -66,13 +66,14 @@ class KimiAgentCompatibilityTests(unittest.TestCase):
         self,
         *,
         model: str = "kimi2",
+        base_url: str = "http://transit.local/v1",
         llm_config: LLMConfig | None = None,
         max_steps: int = 3,
     ) -> KimiAgent:
         return KimiAgent(
             model=model,
             api_key="fake-key",
-            base_url="http://transit.local/v1",
+            base_url=base_url,
             tools=[DummyTool("search")],
             llm_config=llm_config or LLMConfig(stream=False),
             max_steps=max_steps,
@@ -149,6 +150,22 @@ class KimiAgentCompatibilityTests(unittest.TestCase):
         self.assertNotIn("top_p", payload)
         self.assertEqual(payload["extra_body"], {"thinking": {"type": "enabled"}})
 
+    def test_openrouter_kimi_uses_reasoning_enabled_body_and_disables_stream(self):
+        agent = self.make_agent(
+            model="moonshotai/kimi-k2-thinking",
+            base_url="https://openrouter.ai/api/v1",
+            llm_config=LLMConfig(enable_thinking=True),
+        )
+        agent.client = FakeClient([make_response(SimpleNamespace(content="done"))])
+        agent.messages = [{"role": "user", "content": "hello"}]
+
+        agent._call_llm()
+
+        payload = agent.client.chat.completions.calls[0]
+        self.assertEqual(payload["model"], "moonshotai/kimi-k2-thinking")
+        self.assertEqual(payload["extra_body"], {"reasoning": {"enabled": True}})
+        self.assertNotIn("stream", payload)
+
     def test_parse_response_message_preserves_reasoning_and_tool_history_shape(self):
         agent = self.make_agent()
         message = SimpleNamespace(
@@ -200,6 +217,34 @@ class KimiAgentCompatibilityTests(unittest.TestCase):
                     },
                 }
             ],
+        )
+
+    def test_parse_response_message_preserves_openrouter_reasoning_details(self):
+        agent = self.make_agent()
+        reasoning_details = [
+            {
+                "type": "reasoning.text",
+                "text": "Need to search first.",
+                "signature": "opaque",
+            }
+        ]
+        message = SimpleNamespace(
+            content="Final answer.",
+            reasoning="Need to search first.",
+            reasoning_details=reasoning_details,
+        )
+
+        parsed = agent._parse_response_message(message)
+
+        self.assertEqual(parsed["reasoning_content"], "Need to search first.")
+        self.assertEqual(parsed["reasoning_details"], reasoning_details)
+        self.assertEqual(
+            parsed["assistant_message"],
+            {
+                "role": "assistant",
+                "content": "Final answer.",
+                "reasoning_details": reasoning_details,
+            },
         )
 
     def test_run_loop_executes_tool_and_appends_tool_message_with_name_and_tool_call_id(self):
