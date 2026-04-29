@@ -1,11 +1,21 @@
+import ast
 import json
 import re
+from typing import Any
 
-from Gizmo.agents.base_agent import BaseAgent
+from Gizmo.agents.base_agent import BaseAgent, ToolCallRecord
 from Gizmo.prompts.system_prompt import QWEN_SYSTEM_PROMPT
 
 
 class QwenAgent(BaseAgent):
+    """Qwen adapter that uses prompt-injected XML tools and local parsing.
+
+    This intentionally does not send OpenAI-compatible ``tools`` to vLLM. The
+    Qwen chat template can render tool schemas into the system prompt, but when
+    vLLM reasoning/tool parsers are disabled we need to reproduce that contract
+    locally and parse raw assistant content ourselves.
+    """
+
     _TOOL_MARKERS = (
         "<tool_call",
         "</tool_call>",
@@ -15,33 +25,7 @@ class QwenAgent(BaseAgent):
         "</parameter>",
     )
 
-    def __init__(self, *args, system_prompt: str = QWEN_SYSTEM_PROMPT, **kwargs):
-        super().__init__(*args, system_prompt=system_prompt, **kwargs)
-        self.system_prompt = self._build_system_prompt()
-
-    def _build_system_prompt(self) -> str:
-        tool_blocks = []
-        for tool in self.tools.values():
-            tool_blocks.append(
-                json.dumps(
-                    {
-                        "name": tool.name,
-                        "description": tool.description,
-                        "parameters": tool.parameters,
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                )
-            )
-        tools_text = "\n".join(tool_blocks)
-
-        if "{tool_des}" in self.system_prompt:
-            return self.system_prompt.format(tool_des=f"<tools>\n{tools_text}\n</tools>" if tools_text else "")
-
-        if not tools_text:
-            return self.system_prompt
-
-        tool_instruction = f"""# Tools
+    _TOOL_INSTRUCTION = """# Tools
 
 You have access to the following functions:
 
@@ -70,23 +54,151 @@ Reminder:
 - Required parameters MUST be specified
 - You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after
 - If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls
-</IMPORTANT>""".strip()
+</IMPORTANT>"""
 
-        return f"{self.system_prompt}\n\n{tool_instruction}"
+    def __init__(self, *args, system_prompt: str = QWEN_SYSTEM_PROMPT, **kwargs):
+        super().__init__(*args, system_prompt=system_prompt, **kwargs)
+        self.system_prompt = self._build_system_prompt()
 
-    def _parse_reasoning_content(self, content: str) -> str:
+    def _default_stream(self) -> bool:
+        return False
+
+    def _tool_schema_for_prompt(self, tool) -> dict:
+        return tool.to_schema()
+
+    def _build_tools_text(self) -> str:
+        tool_blocks = []
+        for tool in self.tools.values():
+            tool_blocks.append(
+                json.dumps(
+                    self._tool_schema_for_prompt(tool),
+                    ensure_ascii=False,
+                )
+            )
+        return "\n".join(tool_blocks)
+
+    def _build_system_prompt(self) -> str:
+        tools_text = self._build_tools_text()
+        if "{tool_des}" in self.system_prompt:
+            replacement = f"<tools>\n{tools_text}\n</tools>" if tools_text else ""
+            return self.system_prompt.format(tool_des=replacement)
+
+        if not tools_text:
+            return self.system_prompt
+
+        tool_instruction = self._TOOL_INSTRUCTION.format(tools_text=tools_text).strip()
+        return f"{tool_instruction}\n\n{self.system_prompt}"
+
+    @staticmethod
+    def _normalize_content(content: Any) -> str:
+        if content is None:
+            return ""
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, str):
+                    text = item
+                elif isinstance(item, dict):
+                    text = item.get("text") or item.get("content") or ""
+                else:
+                    text = str(item)
+                if text:
+                    parts.append(str(text))
+            return "".join(parts).strip()
+        return str(content).strip()
+
+    @staticmethod
+    def _get_field(obj: Any, name: str, default=None):
+        if obj is None:
+            return default
+        if isinstance(obj, dict):
+            return obj.get(name, default)
+        return getattr(obj, name, default)
+
+    def _call_llm(self):
+        raw_messages = [{"role": "system", "content": self.system_prompt}] + self.messages
+        messages = self._apply_context_managers(raw_messages)
+        messages = self._prepare_messages_for_llm(messages)
+        self._persist_processed_messages(messages)
+        cfg = self.llm_config
+
+        kwargs: dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+        }
+
+        if cfg.max_tokens is not None:
+            kwargs["max_tokens"] = cfg.max_tokens
+        if cfg.temperature is not None:
+            kwargs["temperature"] = cfg.temperature
+        if cfg.top_p is not None:
+            kwargs["top_p"] = cfg.top_p
+        if cfg.seed is not None:
+            kwargs["seed"] = cfg.seed
+
+        extra_body = self._build_extra_body()
+        if extra_body:
+            kwargs["extra_body"] = extra_body
+
+        if self._should_stream_response():
+            kwargs["stream"] = True
+
+        kwargs = self._prepare_request_kwargs(kwargs)
+        response = self.client.chat.completions.create(**kwargs)
+        if kwargs.get("stream"):
+            return self._collect_stream_response(response)
+        return response
+
+    def _collect_stream_response(self, stream: Any) -> dict:
+        content_parts: list[str] = []
+        role = "assistant"
+
+        for chunk in stream:
+            choices = self._get_field(chunk, "choices", []) or []
+            for choice in choices:
+                delta = self._get_field(choice, "delta", {}) or {}
+                delta_role = self._get_field(delta, "role")
+                if delta_role:
+                    role = delta_role
+
+                content_piece = self._get_field(delta, "content")
+                if content_piece:
+                    content_parts.append(str(content_piece))
+
+                reasoning_piece = (
+                    self._get_field(delta, "reasoning_content")
+                    or self._get_field(delta, "reasoning")
+                    or self._get_field(delta, "thinking")
+                )
+                if reasoning_piece:
+                    content_parts.append(str(reasoning_piece))
+
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "role": role,
+                        "content": "".join(content_parts),
+                    }
+                }
+            ]
+        }
+
+    @classmethod
+    def _parse_reasoning_content(cls, content: str) -> str:
         content = (content or "").strip()
         if not content:
             return ""
 
-        # 兼容两种情况：完整的 <think>...</think>，以及只有 </think> 结尾（无开头标签，因为qwen3.5很多推理内容没有开头标签）
         think_pattern = re.compile(
             r"<think>\s*(.*?)\s*</think>",
             re.IGNORECASE | re.DOTALL,
         )
         matches = think_pattern.findall(content)
         if matches:
-            return "\n\n".join(m.strip() for m in matches if m.strip())
+            return "\n\n".join(match.strip() for match in matches if match.strip())
 
         close_tag = re.search(r"</think>", content, re.IGNORECASE)
         if close_tag:
@@ -94,7 +206,8 @@ Reminder:
 
         return ""
 
-    def _remove_reasoning_content(self, content: str) -> str:
+    @classmethod
+    def _remove_reasoning_content(cls, content: str) -> str:
         content = (content or "").strip()
         if not content:
             return ""
@@ -108,7 +221,6 @@ Reminder:
         if cleaned != content:
             return cleaned.strip()
 
-        # 没有开头 <think>，但存在 </think>：把 </think> 之前的内容都视为推理
         close_tag = re.search(r"</think>", content, re.IGNORECASE)
         if close_tag:
             return content[close_tag.end() :].strip()
@@ -120,10 +232,20 @@ Reminder:
         value = (raw_value or "").strip()
         if not value:
             return ""
-        try:
-            return json.loads(value)
-        except json.JSONDecodeError:
-            return value
+
+        for loader in (json.loads, ast.literal_eval):
+            try:
+                return loader(value)
+            except Exception:
+                continue
+
+        return value
+
+    @staticmethod
+    def _serialize_parameter_value(value: Any) -> str:
+        if isinstance(value, (dict, list, tuple, int, float, bool)) or value is None:
+            return json.dumps(value, ensure_ascii=False)
+        return str(value)
 
     @classmethod
     def _contains_tool_markup(cls, content: str) -> bool:
@@ -148,29 +270,28 @@ Reminder:
             re.IGNORECASE | re.DOTALL,
         )
 
-        results = []
+        results: list[dict] = []
+        for tool_block in tool_pattern.findall(content):
+            for function_match in function_pattern.finditer(tool_block):
+                tool_name = function_match.group(1).strip()
+                if tool_name not in self.tools:
+                    continue
 
-        tool_blocks = tool_pattern.findall(content)
-        for tool_block in tool_blocks:
-            function_match = function_pattern.search(tool_block)
-            if not function_match:
-                continue
+                arguments = {}
+                function_body = function_match.group(2)
+                for param_name, param_value in parameter_pattern.findall(function_body):
+                    arguments[param_name.strip()] = self._parse_parameter_value(
+                        param_value
+                    )
 
-            tool_name = function_match.group(1).strip()
-            function_body = function_match.group(2)
-
-            arguments = {}
-            for param_name, param_value in parameter_pattern.findall(function_body):
-                arguments[param_name.strip()] = self._parse_parameter_value(param_value)
-
-            results.append(
-                {
-                    "function": {
-                        "name": tool_name,
-                        "arguments": arguments,
+                results.append(
+                    {
+                        "function": {
+                            "name": tool_name,
+                            "arguments": arguments,
+                        }
                     }
-                }
-            )
+                )
 
         return results
 
@@ -179,29 +300,80 @@ Reminder:
         if not content:
             return ""
 
-        cleaned = re.sub(
+        return re.sub(
             r"<tool_call>\s*.*?\s*</tool_call>",
             "",
             content,
             flags=re.IGNORECASE | re.DOTALL,
-        )
-        return cleaned.strip()
+        ).strip()
 
     def _extract_final_content(self, raw_content: str) -> str:
         content = self._remove_reasoning_content(raw_content)
         content = self._remove_tool_calls(content)
         return content.strip()
 
+    @staticmethod
+    def _looks_like_formatted_final_answer(content: str) -> bool:
+        lowered = (content or "").lower()
+        return "exact answer:" in lowered and "confidence:" in lowered
+
+    def _looks_like_unclosed_thinking(self, content: str) -> bool:
+        content = (content or "").strip()
+        if not content:
+            return False
+
+        lowered = content.lower()
+        if "</think>" in lowered or self._looks_like_formatted_final_answer(content):
+            return False
+        if self._contains_tool_markup(content):
+            return False
+        if "<think" in lowered:
+            return True
+
+        # With Qwen thinking enabled, vLLM returns generated text after the
+        # chat-template "<think>\n" prefix. Without a generated "</think>", the
+        # text is still hidden reasoning and should not be accepted as an answer.
+        return bool(self.llm_config.enable_thinking)
+
+    def _build_history_tool_xml(self, tool_calls: list[dict]) -> str:
+        blocks: list[str] = []
+        for tool_call in tool_calls:
+            function = tool_call.get("function", {})
+            tool_name = function.get("name", "")
+            arguments = function.get("arguments", {}) or {}
+            if not tool_name:
+                continue
+
+            lines = ["<tool_call>", f"<function={tool_name}>"]
+            for name, value in arguments.items():
+                lines.extend(
+                    [
+                        f"<parameter={name}>",
+                        self._serialize_parameter_value(value),
+                        "</parameter>",
+                    ]
+                )
+            lines.extend(["</function>", "</tool_call>"])
+            blocks.append("\n".join(lines))
+        return "\n".join(blocks)
+
     def _parse_response(self, raw_content: str) -> dict:
-        tool_calls = self._parse_tool_calls(raw_content)
+        raw_content = self._normalize_content(raw_content)
         reasoning_content = self._parse_reasoning_content(raw_content)
+        visible_content = self._remove_reasoning_content(raw_content)
+        tool_calls = self._parse_tool_calls(visible_content)
+        if not tool_calls:
+            tool_calls = self._parse_tool_calls(raw_content)
         final_content = self._extract_final_content(raw_content)
+
         malformed_tool_call = not tool_calls and self._contains_tool_markup(raw_content)
-        if malformed_tool_call:
+        unclosed_thinking = self._looks_like_unclosed_thinking(raw_content)
+        if tool_calls or malformed_tool_call or unclosed_thinking:
             final_content = ""
 
-        # 只保留标准 message 字段，避免非法字段传回 API
-        # 同时保留 raw_content，让模型下一轮还能看到自己刚才的原始 <tool_call>
+        if not final_content and self._looks_like_formatted_final_answer(reasoning_content):
+            final_content = reasoning_content
+
         assistant_message = {
             "role": "assistant",
             "content": raw_content,
@@ -209,19 +381,60 @@ Reminder:
 
         return {
             "assistant_message": assistant_message,
+            "assistant_messages": [assistant_message],
             "tool_calls": tool_calls,
             "reasoning_content": reasoning_content,
             "final_content": final_content,
-            "retryable": malformed_tool_call,
-            "retry_reason": "malformed_tool_call_xml" if malformed_tool_call else "",
+            "retryable": malformed_tool_call or unclosed_thinking,
+            "retry_reason": (
+                "malformed_tool_call_xml"
+                if malformed_tool_call
+                else "unclosed_qwen_thinking"
+                if unclosed_thinking
+                else ""
+            ),
         }
+
+    def _parse_llm_response(self, response) -> dict:
+        choices = self._get_field(response, "choices", []) or []
+        if not choices:
+            return self._parse_response("")
+        first_choice = choices[0]
+        message = self._get_field(first_choice, "message", {})
+        raw_content = self._get_field(message, "content") or ""
+        return self._parse_response(raw_content)
 
     def _build_tool_result_messages(self, tool_name: str, tool_result: str) -> list[dict]:
         return [
             {
                 "role": "user",
-                "content": (
-                    f"<tool_response>\n{tool_result}\n</tool_response>\n"
-                ),
+                "content": f"<tool_response>\n{tool_result}\n</tool_response>\n",
             }
         ]
+
+    def _execute_parsed_tool_calls(self, step, tool_calls: list[dict]) -> None:
+        tool_response_blocks: list[str] = []
+        for tc in tool_calls:
+            tool_name = tc["function"]["name"]
+            tool_args = tc["function"].get("arguments", {})
+            if not isinstance(tool_args, dict):
+                tool_args = {}
+
+            tool_result = self._execute_tool(tool_name, tool_args)
+            step.tool_calls.append(
+                ToolCallRecord(name=tool_name, args=tool_args, result=tool_result)
+            )
+            self._fire("after_tool", self.state, tool_name, tool_args, tool_result)
+            tool_response_blocks.append(
+                f"<tool_response>\n{tool_result}\n</tool_response>"
+            )
+
+        if tool_response_blocks:
+            self.messages.append(
+                {
+                    "role": "user",
+                    "content": "\n".join(tool_response_blocks) + "\n",
+                }
+            )
+
+        self.state.tool_rounds += 1

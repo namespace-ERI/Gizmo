@@ -28,11 +28,10 @@ The current design keeps the runtime generic and leaves task-specific strategy t
 
 - `GPTAgent`: OpenAI Responses API adapter with native function calling
 - official function-tool schema and `function_call_output` reinjection
-- `QwenAgent`: prompt-based Qwen adapter
-- XML tool-call prompt construction
-- `<think>...</think>` reasoning extraction
-- prompt-based multi-tool parsing
-- tool-result reinjection as `<tool_response>...</tool_response>`
+- `QwenAgent`: OpenAI-compatible chat/function-calling adapter for Qwen backends
+- native `tools` request payloads and `tool_calls` parsing
+- `<think>...</think>` reasoning extraction when Qwen emits inline thinking text
+- tool-result reinjection as `role: tool` messages
 - `GPTOssAgent`: native tool-calling adapter aligned to the `gpt-oss` chat template
 
 ### Built-in Tools
@@ -316,39 +315,43 @@ If you return a custom stop reason from `should_stop`, `BaseAgent` currently ret
 
 `QwenAgent` is the main built-in adapter. It:
 
-- builds a system prompt that embeds the available tool definitions
-- instructs the model to output tool calls in XML
+- sends available tool definitions through the OpenAI-compatible `tools` field
 - extracts reasoning from `<think>...</think>`
-- extracts tool calls from `<tool_call>...</tool_call>`
-- strips reasoning and tool XML when computing `final_content`
-- appends raw assistant output back into the conversation so the model can see its previous tool-call text
+- parses native assistant `tool_calls`
+- strips inline reasoning text when computing `final_content`
+- appends native assistant tool-call messages and `role: tool` results back into the conversation
 
-Important parser note:
+Important compatibility note:
 
-- the current built-in `QwenAgent` parser keeps parameter bodies as strings
-- if you need automatic JSON deserialization for arrays or objects, extend `QwenAgent` or wire in `Gizmo.utils.message_parser`
-- scalar string parameters work out of the box
+- Qwen thinking backends may expose reasoning either through `reasoning_content` or inline `<think>...</think>` text; both are preserved in trajectory reasoning.
+- Non-standard reasoning fields are kept in saved trajectories but stripped from outbound chat-completions history before the next request.
 
-Expected tool-call format:
+Expected tool-call flow:
 
-```xml
-<tool_call>
-<function=search>
-<parameter=query>
-example query
-</parameter>
-</function>
-</tool_call>
+```python
+assistant_message = {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+        {
+            "id": "call_1",
+            "type": "function",
+            "function": {
+                "name": "search",
+                "arguments": "{\"query\": \"example query\"}",
+            },
+        }
+    ],
+}
+tool_result_message = {
+    "role": "tool",
+    "tool_call_id": "call_1",
+    "name": "search",
+    "content": "...tool result...",
+}
 ```
 
-Tool results are fed back as:
-
-```xml
-<tool_response>
-...tool output...
-</tool_response>
-Please continue.
-```
+Tool results are fed back as native `role: tool` messages linked by `tool_call_id`.
 
 ## GPTAgent Behavior
 
@@ -631,8 +634,7 @@ For chat-style agents this is a message list with the system prompt; for `GPTAge
 
 - `pyproject.toml` does not yet declare runtime dependencies.
 - Tool re-exports are still minimal; importing from concrete module paths such as `Gizmo.agents.base_agent` or `Gizmo.tools.search_tool` remains the clearest option.
-- `QwenAgent` uses prompt-based XML tool calling, not OpenAI native tool calling.
-- `QwenAgent` does not currently deserialize XML parameter bodies into Python lists or dicts; structured tool args need a custom parser integration.
+- `QwenAgent` expects an OpenAI-compatible Qwen endpoint with native chat `tools` / `tool_calls` support.
 - `GPTAgent` currently executes locally registered Python `function` tools; if you want hosted OpenAI tools such as web search or file search, wire them into your project flow explicitly.
 - No built-in memory manager is included in the package; memory, shared state, and context policies are expected to be implemented with hooks and context managers.
 - `mock_llm.py` is currently just a placeholder.

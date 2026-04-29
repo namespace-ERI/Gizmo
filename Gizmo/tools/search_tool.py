@@ -6,8 +6,11 @@ Behavioral notes:
 - Keeps the existing Gizmo tool schema: name is `search`, argument is `query`.
 - Accepts one or more queries and returns the same textual result format as the
   reference implementation.
+- Repairs common malformed batched query strings produced by XML tool callers,
+  such as missing brackets around `"query 1", "query 2"` fragments.
 """
 
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -21,15 +24,21 @@ _SEARCH_PARAMETERS = {
         "query": {
             "type": "array",
             "items": {"type": "string"},
-            "description": "A list of search queries.",
+            "description": (
+                "A JSON array of search query strings, e.g. "
+                "[\"query one\", \"query two\"]. Do not pass comma-separated "
+                "plain text; keep the square brackets and quotes."
+            ),
         }
     },
     "required": ["query"],
 }
 
 _SEARCH_DESCRIPTION = (
-    "Performs batched web searches: supply an array 'query'; the tool retrieves "
-    "the top results for each query in one call."
+    "Performs batched web searches. The 'query' argument must be a JSON array "
+    "of strings, for example [\"query one\", \"query two\"]. Do not omit the "
+    "square brackets or quotes. The tool retrieves the top results for each "
+    "query in one call."
 )
 
 _SERP_URL = "http://api2.rag.ac.cn/serp_search_v1"
@@ -42,6 +51,9 @@ class _RetryableSearchError(Exception):
 
 class SearchTool(BaseTool):
     """Batch Google search tool backed by the rag.ac.cn SERP proxy."""
+
+    _QUOTED_QUERY_DELIMITER_RE = re.compile(r"""(?<=["'])\s*,\s*(?=["'])""")
+    _TRAILING_QUOTED_QUERY_DELIMITER_RE = re.compile(r"""(?<!^)(?<![\[,])["']\s*,\s*["']""")
 
     def __init__(self, api_key: str):
         super().__init__(
@@ -151,9 +163,144 @@ class SearchTool(BaseTool):
             print(f"Serper Error: {type(exc).__name__}: {exc}")
             return f"Search Error: {type(exc).__name__}: {exc}"
 
+    @classmethod
+    def _clean_repaired_query(cls, query: str) -> str:
+        query = query.strip()
+        query = query.strip("[],")
+        query = cls._strip_wrapping_quotes(query)
+        query = query.strip("[],")
+        query = query.strip(" \t\r\n\"'")
+        return query.strip()
+
+    @classmethod
+    def _clean_single_query_string(cls, query: str) -> str:
+        query = str(query or "").strip()
+        if len(query) >= 2 and query[0] == "[" and query[-1] == "]":
+            inner = query[1:-1].strip()
+            if inner and not cls._repair_query_batch_string(inner):
+                query = inner
+
+        query = query.strip().strip(",")
+        if (
+            len(query) >= 2
+            and query[0] == query[-1]
+            and query[0] in {"'", '"'}
+            and query.count(query[0]) % 2 == 1
+        ):
+            query = query[:-1].strip()
+        else:
+            query = cls._strip_wrapping_quotes(query)
+        for quote in ("'", '"'):
+            if query.startswith(quote) and query.count(quote) == 1:
+                query = query[1:].strip()
+            if query.endswith(quote) and query.count(quote) == 1:
+                query = query[:-1].strip()
+        query = query.strip().strip(",")
+        return query.strip()
+
+    @classmethod
+    def _split_quoted_query_batch(cls, text: str) -> list[str]:
+        normalized = text.strip().replace('\\"', '"').replace("\\'", "'")
+        body = normalized.strip().strip("[]").strip()
+        if not cls._QUOTED_QUERY_DELIMITER_RE.search(body):
+            return []
+
+        parts = [
+            cls._clean_single_query_string(part)
+            for part in cls._QUOTED_QUERY_DELIMITER_RE.split(body)
+        ]
+        return [part for part in parts if part]
+
+    @classmethod
+    def _split_trailing_quoted_query_batch(cls, text: str) -> list[str]:
+        normalized = text.strip().replace('\\"', '"').replace("\\'", "'")
+        body = normalized.strip().strip("[]").strip()
+        if not cls._TRAILING_QUOTED_QUERY_DELIMITER_RE.search(body):
+            return []
+
+        parts = [
+            cls._clean_single_query_string(part)
+            for part in cls._TRAILING_QUOTED_QUERY_DELIMITER_RE.split(body)
+        ]
+        return [part for part in parts if part]
+
+    @classmethod
+    def _split_newline_query_batch(cls, text: str) -> list[str]:
+        body = text.strip().strip("[]").strip()
+        if "\n" not in body:
+            return []
+
+        parts = []
+        for line in body.splitlines():
+            line = cls._clean_repaired_query(line)
+            if not line:
+                continue
+            line = re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", line).strip()
+            line = cls._clean_repaired_query(line)
+            if line:
+                parts.append(line)
+        if not 2 <= len(parts) <= 8:
+            return []
+        if not all(cls._looks_like_query_clause(part) for part in parts):
+            return []
+        return parts
+
+    @classmethod
+    def _looks_like_query_clause(cls, text: str) -> bool:
+        text = cls._clean_repaired_query(text)
+        if len(text) < 16:
+            return False
+        if re.search(r"https?://", text):
+            return False
+        return len(re.findall(r"\S+", text)) >= 3
+
+    @classmethod
+    def _split_plain_query_batch(cls, text: str) -> list[str]:
+        body = text.strip().strip("[]").strip()
+        if "," not in body:
+            return []
+
+        parts = [cls._clean_repaired_query(part) for part in body.split(",")]
+        parts = [part for part in parts if part]
+        if not 2 <= len(parts) <= 8:
+            return []
+        if len(parts) == 2 and not all(len(part) >= 24 for part in parts):
+            return []
+        if not all(cls._looks_like_query_clause(part) for part in parts):
+            return []
+        return parts
+
+    @classmethod
+    def _repair_query_batch_string(cls, value: str) -> list[str]:
+        text = (value or "").strip()
+        if not text:
+            return []
+
+        for splitter in (
+            cls._split_quoted_query_batch,
+            cls._split_trailing_quoted_query_batch,
+            cls._split_newline_query_batch,
+            cls._split_plain_query_batch,
+        ):
+            repaired = splitter(text)
+            if len(repaired) > 1:
+                return repaired
+        return []
+
+    @classmethod
+    def _coerce_queries(cls, query) -> list[str]:
+        queries = cls.coerce_str_list(query, field_name="query")
+        if isinstance(query, str) and len(queries) == 1:
+            repaired = cls._repair_query_batch_string(query)
+            if len(repaired) > 1:
+                return repaired
+            cleaned = cls._clean_single_query_string(queries[0])
+            return [cleaned] if cleaned else []
+        return [cls._clean_single_query_string(q) for q in queries if cls._clean_single_query_string(q)]
+
     def execute(self, query) -> str:
         try:
-            queries = self.coerce_str_list(query, field_name="query")
+            queries = self._coerce_queries(query)
         except ValueError as exc:
             return f"[SearchTool] {exc}"
 
