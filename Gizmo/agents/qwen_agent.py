@@ -68,7 +68,7 @@ Reminder:
 
     def _build_tools_text(self) -> str:
         tool_blocks = []
-        for tool in self.tools.values():
+        for tool in self._current_tools().values():
             tool_blocks.append(
                 json.dumps(
                     self._tool_schema_for_prompt(tool),
@@ -88,6 +88,16 @@ Reminder:
 
         tool_instruction = self._TOOL_INSTRUCTION.format(tools_text=tools_text).strip()
         return f"{tool_instruction}\n\n{self.system_prompt}"
+
+    def _final_answer_system_prompt(self) -> str:
+        prompt = self.system_prompt
+        tool_header = "# Tools\n\nYou have access to the following functions:\n\n<tools>"
+        if prompt.startswith(tool_header):
+            important_end = "</IMPORTANT>"
+            important_idx = prompt.find(important_end)
+            if important_idx >= 0:
+                prompt = prompt[important_idx + len(important_end) :].lstrip()
+        return f"{prompt}\n\n{self._FINAL_ANSWER_ONLY_SYSTEM_SUFFIX}"
 
     @staticmethod
     def _normalize_content(content: Any) -> str:
@@ -120,6 +130,8 @@ Reminder:
     def _call_llm(self):
         raw_messages = [{"role": "system", "content": self.system_prompt}] + self.messages
         messages = self._apply_context_managers(raw_messages)
+        if self._is_final_answer_only_call():
+            messages = self._prepare_final_answer_only_messages(messages)
         messages = self._prepare_messages_for_llm(messages)
         self._persist_processed_messages(messages)
         cfg = self.llm_config
@@ -274,7 +286,7 @@ Reminder:
         for tool_block in tool_pattern.findall(content):
             for function_match in function_pattern.finditer(tool_block):
                 tool_name = function_match.group(1).strip()
-                if tool_name not in self.tools:
+                if tool_name not in self._current_tools():
                     continue
 
                 arguments = {}

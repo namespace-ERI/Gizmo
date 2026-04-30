@@ -1,6 +1,7 @@
 import copy
 import json
 import os
+import re
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -154,6 +155,17 @@ class TrajectoryStep:
 class BaseAgent:
     _PARSE_RETRY_LIMIT = 1
     _FINALIZE_FOLLOWUP_LIMIT = 4
+    _FINAL_ANSWER_ONLY_SYSTEM_SUFFIX = (
+        "The conversation has reached the configured context window. "
+        "You must now provide one final answer based only on the information "
+        "already present in the conversation. Do not call tools, do not request "
+        "tool use, and do not continue the investigation."
+    )
+    _FINAL_ANSWER_ONLY_USER_PROMPT = (
+        "The conversation has reached the configured context window. Provide "
+        "your best final answer now based only on what is already available. "
+        "Do not call any tools."
+    )
 
     def __init__(
         self,
@@ -178,6 +190,9 @@ class BaseAgent:
         self.trajectory: list[TrajectoryStep] = []
         self.state: RunState = RunState()
         self.llm_config = llm_config or LLMConfig()
+        self._force_final_answer_once = False
+        self._force_final_answer_reason = ""
+        self._force_final_answer_prompt = ""
 
         self.client = OpenAI(
             api_key=api_key,
@@ -267,6 +282,93 @@ class BaseAgent:
     def _use_native_tools(self) -> bool:
         return False
 
+    def request_final_answer_once(
+        self,
+        reason: str = "token_budget",
+        prompt: Optional[str] = None,
+    ) -> None:
+        """Force the next LLM call to be a single final-answer-only call."""
+        self._force_final_answer_once = True
+        self._force_final_answer_reason = reason or "token_budget"
+        self._force_final_answer_prompt = (
+            prompt or self._FINAL_ANSWER_ONLY_USER_PROMPT
+        )
+
+    def _is_final_answer_only_call(self) -> bool:
+        return bool(self._force_final_answer_once)
+
+    def _final_answer_system_prompt(self) -> str:
+        return f"{self.system_prompt}\n\n{self._FINAL_ANSWER_ONLY_SYSTEM_SUFFIX}"
+
+    def _current_tools(self) -> dict:
+        if self._is_final_answer_only_call():
+            return {}
+        return self.tools
+
+    def _prepare_final_answer_only_messages(self, messages: list[dict]) -> list[dict]:
+        prepared = [dict(message) for message in messages]
+        if prepared and prepared[0].get("role") == "system":
+            prepared[0]["content"] = self._final_answer_system_prompt()
+        else:
+            prepared.insert(
+                0,
+                {
+                    "role": "system",
+                    "content": self._final_answer_system_prompt(),
+                },
+            )
+
+        prompt = self._force_final_answer_prompt or self._FINAL_ANSWER_ONLY_USER_PROMPT
+        if not prepared or prepared[-1].get("content") != prompt:
+            prepared.append({"role": "user", "content": prompt})
+        return prepared
+
+    @staticmethod
+    def _strip_tool_request_markup(text: str) -> str:
+        text = str(text or "")
+        text = re.sub(
+            r"<tool_call>\s*.*?\s*</tool_call>",
+            "",
+            text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        return text.strip()
+
+    @classmethod
+    def _content_from_assistant_messages(parsed: dict) -> str:
+        parts: list[str] = []
+        for message in parsed.get("assistant_messages") or []:
+            content = message.get("content")
+            if isinstance(content, str):
+                content = cls._strip_tool_request_markup(content)
+                if content:
+                    parts.append(content)
+        return "\n\n".join(parts).strip()
+
+    def _coerce_final_answer_only_parsed(self, parsed: dict) -> dict:
+        final_content = (
+            self._strip_tool_request_markup(parsed.get("final_content") or "")
+            or self._content_from_assistant_messages(parsed)
+            or parsed.get("reasoning_content")
+            or f"[stopped: {self._force_final_answer_reason or 'token_budget'}]"
+        )
+        coerced = dict(parsed)
+        coerced["assistant_message"] = {"role": "assistant", "content": final_content}
+        coerced["assistant_messages"] = [coerced["assistant_message"]]
+        coerced["tool_calls"] = []
+        coerced["final_content"] = final_content
+        coerced["retryable"] = False
+        coerced["retry_reason"] = ""
+        return coerced
+
+    def _consume_final_answer_only_call(self, parsed: dict) -> dict:
+        coerced = self._coerce_final_answer_only_parsed(parsed)
+        self.state.stop_reason = self._force_final_answer_reason or "token_budget"
+        self._force_final_answer_once = False
+        self._force_final_answer_reason = ""
+        self._force_final_answer_prompt = ""
+        return coerced
+
     def _build_extra_body(self) -> Optional[dict]:
         """合并 enable_thinking 标志和用户自定义 extra_body。"""
         cfg = self.llm_config
@@ -297,6 +399,8 @@ class BaseAgent:
     def _call_llm(self):
         raw_messages = [{"role": "system", "content": self.system_prompt}] + self.messages
         messages = self._apply_context_managers(raw_messages)
+        if self._is_final_answer_only_call():
+            messages = self._prepare_final_answer_only_messages(messages)
         messages = self._prepare_messages_for_llm(messages)
         self._persist_processed_messages(messages)
         cfg = self.llm_config
@@ -318,7 +422,7 @@ class BaseAgent:
             kwargs["extra_body"] = extra_body
 
         if self._use_native_tools():
-            tools = [tool.to_schema() for tool in self.tools.values()] or None
+            tools = [tool.to_schema() for tool in self._current_tools().values()] or None
             if tools:
                 kwargs["tools"] = tools
 
@@ -420,6 +524,17 @@ class BaseAgent:
             parsed = self._parse_llm_response(resp)
             self._fire("after_llm", self.state, parsed)
 
+            if self._is_final_answer_only_call():
+                parsed = self._consume_final_answer_only_call(parsed)
+                self.messages.extend(self._assistant_messages_from_parsed(parsed))
+                step = TrajectoryStep(
+                    step=self.state.step,
+                    reasoning=parsed.get("reasoning_content", ""),
+                    final_content=parsed.get("final_content", ""),
+                )
+                self.trajectory.append(step)
+                return parsed
+
             should_retry, retry_reason = self._should_retry_parsed_response(parsed)
             if should_retry and retry_budget > 0:
                 retry_budget -= 1
@@ -448,6 +563,9 @@ class BaseAgent:
         self.messages = []
         self.trajectory = []
         self.state = RunState()
+        self._force_final_answer_once = False
+        self._force_final_answer_reason = ""
+        self._force_final_answer_prompt = ""
         for cm in self._context_managers:
             cm.reset()
         self.messages.append({"role": "user", "content": user_input})
@@ -466,11 +584,22 @@ class BaseAgent:
             self._fire("before_llm", self.state, self.messages)
             resp = self._call_llm()
             parsed = self._parse_llm_response(resp)
+            self._fire("after_llm", self.state, parsed)
+
+            if self._is_final_answer_only_call():
+                parsed = self._consume_final_answer_only_call(parsed)
+                self.messages.extend(self._assistant_messages_from_parsed(parsed))
+                step = TrajectoryStep(
+                    step=self.state.step,
+                    reasoning=parsed.get("reasoning_content", ""),
+                    final_content=parsed.get("final_content", ""),
+                )
+                self.trajectory.append(step)
+                return parsed
+
             tool_calls = parsed["tool_calls"]
             final_content = parsed["final_content"]
             reasoning = parsed.get("reasoning_content", "")
-
-            self._fire("after_llm", self.state, parsed)
 
             should_retry, retry_reason = self._should_retry_parsed_response(parsed)
             if should_retry and retry_budget > 0:
@@ -713,6 +842,9 @@ class NativeToolChatAgent(BaseAgent):
         raw_messages = [{"role": "system", "content": self.system_prompt}] + self.messages
         messages = self._apply_context_managers(raw_messages)
         messages = self._prepare_messages_for_llm(messages)
+        if self._is_final_answer_only_call():
+            messages = self._prepare_final_answer_only_messages(messages)
+            messages = self._prepare_messages_for_llm(messages)
         self._persist_processed_messages(messages)
         cfg = self.llm_config
 
@@ -729,14 +861,14 @@ class NativeToolChatAgent(BaseAgent):
             kwargs["top_p"] = cfg.top_p
         if cfg.seed is not None:
             kwargs["seed"] = cfg.seed
-        if cfg.tool_choice is not None:
+        if cfg.tool_choice is not None and not self._is_final_answer_only_call():
             kwargs["tool_choice"] = copy.deepcopy(cfg.tool_choice)
 
         extra_body = self._build_extra_body()
         if extra_body:
             kwargs["extra_body"] = extra_body
 
-        tools = [tool.to_schema() for tool in self.tools.values()] or None
+        tools = [tool.to_schema() for tool in self._current_tools().values()] or None
         if tools:
             kwargs["tools"] = tools
 
