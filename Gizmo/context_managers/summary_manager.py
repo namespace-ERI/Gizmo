@@ -131,12 +131,14 @@ class RollingSummaryContextManager(ContextManager):
         request_timeout: float = 120.0,
         encoder_name: str = "cl100k_base",
         include_structured_fields: bool = False,
+        summary_extra_body: Optional[dict] = None,
     ):
         self._model = summary_model or model
         self._max_input_tokens = int(max_input_tokens)
         self._summary_prompt = summary_prompt or DEFAULT_SUMMARY_PROMPT
         self._summary_max_tokens = int(summary_max_tokens)
         self._summary_temperature = float(summary_temperature)
+        self._summary_extra_body = summary_extra_body
         self._client = OpenAI(
             api_key=api_key,
             base_url=base_url,
@@ -237,15 +239,19 @@ class RollingSummaryContextManager(ContextManager):
             return ""
 
         user_content = f"{SUMMARY_USER_PROMPT_PREFIX}{rendered}"
-        response = self._client.chat.completions.create(
-            model=self._model,
-            messages=[
+        request_kwargs = {
+            "model": self._model,
+            "messages": [
                 {"role": "system", "content": self._summary_prompt},
                 {"role": "user", "content": user_content},
             ],
-            temperature=self._summary_temperature,
-            max_tokens=self._summary_max_tokens,
-        )
+            "temperature": self._summary_temperature,
+            "max_tokens": self._summary_max_tokens,
+        }
+        if self._summary_extra_body:
+            request_kwargs["extra_body"] = self._summary_extra_body
+
+        response = self._client.chat.completions.create(**request_kwargs)
         return _stringify_content(response.choices[0].message.content).strip()
 
     @staticmethod

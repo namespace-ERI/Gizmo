@@ -414,6 +414,19 @@ Reminder:
         first_choice = choices[0]
         message = self._get_field(first_choice, "message", {})
         raw_content = self._get_field(message, "content") or ""
+        # vLLM's Qwen reasoning parser can return a reasoning-only response
+        # with an empty content field. Preserve it as unclosed thinking so the
+        # retry/finalization path can request a visible answer instead of
+        # silently treating the empty payload as a completed turn.
+        if not raw_content:
+            reasoning_content = (
+                self._get_field(message, "reasoning_content")
+                or self._get_field(message, "reasoning")
+                or self._get_field(message, "thinking")
+                or ""
+            )
+            if reasoning_content:
+                raw_content = f"<think>\n{reasoning_content}"
         return self._parse_response(raw_content)
 
     def _build_tool_result_messages(self, tool_name: str, tool_result: str) -> list[dict]:

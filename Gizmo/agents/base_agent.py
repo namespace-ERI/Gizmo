@@ -335,7 +335,7 @@ class BaseAgent:
         return text.strip()
 
     @classmethod
-    def _content_from_assistant_messages(parsed: dict) -> str:
+    def _content_from_assistant_messages(cls, parsed: dict) -> str:
         parts: list[str] = []
         for message in parsed.get("assistant_messages") or []:
             content = message.get("content")

@@ -9,6 +9,7 @@ Behavioral notes:
 """
 
 import json
+import os
 import re
 import time
 
@@ -42,7 +43,11 @@ _VISIT_PARAMETERS = {
 _VISIT_DESCRIPTION = "Visit webpage(s) and return the summary of the content."
 
 _MAX_CONTENT_TOKENS = 95_000
-_JINA_VISIT_URL = "http://api.rag.ac.cn/visit_pages_v1"
+_JINA_VISIT_URL = os.getenv(
+    "JINA_VISIT_URL",
+    "http://api1.rag.ac.cn/visit_pages_v1",
+)
+_PUBLIC_JINA_READER_PREFIX = "https://r.jina.ai/"
 _JINA_CONNECT_TIMEOUT_SECONDS = 10.0
 _JINA_READ_TIMEOUT_SECONDS = 180.0
 _MAX_VISIT_RETRIES = 10
@@ -205,6 +210,13 @@ class VisitTool(BaseTool):
                 result_text = (data.get("results") or {}).get(result_url, "")
                 if not isinstance(result_text, str) or not result_text.strip():
                     return "[visit] Empty content."
+                upstream_error = self._upstream_result_error(result_text)
+                if upstream_error:
+                    print(
+                        "[Jina Reader] Proxy returned an embedded error; "
+                        f"trying public reader: {upstream_error}"
+                    )
+                    return self._fetch_public_jina(url)
 
                 pattern = r"\(https?:.*?\)|\[https?:.*?\]"
                 text = re.sub(pattern, "", result_text)
@@ -228,6 +240,38 @@ class VisitTool(BaseTool):
             return "[visit] Failed to read page."
         print(f"Jina Error: {type(last_error).__name__}: {last_error}")
         return "[visit] Failed to read page."
+
+    @staticmethod
+    def _upstream_result_error(result_text: str) -> str:
+        try:
+            payload = json.loads(result_text)
+        except (TypeError, json.JSONDecodeError):
+            return ""
+        if not isinstance(payload, dict):
+            return ""
+
+        code = payload.get("code")
+        name = str(payload.get("name") or payload.get("error") or "").strip()
+        if isinstance(code, int) and code >= 400:
+            return name or f"upstream code {code}"
+        if name and payload.get("data") is None:
+            return name
+        return ""
+
+    def _fetch_public_jina(self, url: str) -> str:
+        reader_url = f"{_PUBLIC_JINA_READER_PREFIX}{url}"
+        try:
+            response = requests.get(
+                reader_url,
+                headers={"Accept": "text/plain"},
+                timeout=(_JINA_CONNECT_TIMEOUT_SECONDS, self.jina_timeout),
+            )
+            if response.status_code >= 400 or not response.text.strip():
+                return "[visit] Failed to read page."
+            return response.text
+        except requests.RequestException as exc:
+            print(f"Public Jina Error: {type(exc).__name__}: {exc}")
+            return "[visit] Failed to read page."
 
     def _call_llm(self, messages: list) -> str:
         content = ""
